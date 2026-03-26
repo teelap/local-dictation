@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+venv/
+.venv/
+*.egg-info/
+
+# Build artifacts
+build/
+dist/
+*.spec
+
+# Audio temp files
+temp_dictation.wav
+*.wav
+*.mp3
+
+# Environment
+.env
+.env.local
+
+# IDE
+.vscode/
+.idea/
