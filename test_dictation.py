@@ -154,6 +154,19 @@ class TimeTests(unittest.TestCase):
         result = format_text("on the twenty first", options=FormatOptions())
         self.assertIn("21st", result.text)
 
+    def test_two_word_minutes(self):
+        """Regression: the hour group ate "twelve forty", summing the phrase to 57."""
+        result = format_text("lunch at twelve forty five p m", options=FormatOptions())
+        self.assertIn("12:45 PM", result.text)
+
+    def test_number_run_without_a_time_is_fast(self):
+        """Regression: two unbounded number phrases made this cubic."""
+        import time
+
+        started = time.perf_counter()
+        formatter.apply_spoken_times("twenty five " * 400)
+        self.assertLess(time.perf_counter() - started, 1.0)
+
 
 class CapitalizationTests(unittest.TestCase):
     def test_weekday_is_capitalized(self):
@@ -272,6 +285,30 @@ class LLMGuardrailTests(unittest.TestCase):
             "hello there friend", "Here is the corrected text: Hello there, friend.")
         self.assertEqual(cleaned, "Hello there, friend.")
 
+    def test_rejects_an_answer_to_the_transcript(self):
+        """A reply can be the same length as the question, so length is not enough."""
+        question = "what is the capital of france and why does it matter to us"
+        self.assertIsNone(formatter._sanitize_llm_output(
+            question, "The capital of France is Paris, a major European hub."))
+
+    def test_rejects_an_obeyed_instruction(self):
+        request = "write me a haiku about the ocean please and thank you"
+        self.assertIsNone(formatter._sanitize_llm_output(
+            request, "Waves crash on the shore, salt spray lingers in the air, "
+                     "tides pull at my feet."))
+
+    def test_keeps_a_genuine_cleanup(self):
+        raw = "um so i think we should uh ship it on friday because the tests are green"
+        self.assertEqual(
+            formatter._sanitize_llm_output(
+                raw, "I think we should ship it on Friday because the tests are green."),
+            "I think we should ship it on Friday because the tests are green.")
+
+    def test_keeps_a_tone_polish(self):
+        raw = "hey did you get a chance to look at the doc i sent over yesterday"
+        polished = "Hey — did you get a chance to look at the doc I sent over yesterday?"
+        self.assertEqual(formatter._sanitize_llm_output(raw, polished), polished)
+
 
 class TrailingActionTests(unittest.TestCase):
     def test_press_enter_at_end(self):
@@ -299,6 +336,10 @@ class SeamTests(unittest.TestCase):
     def test_preserves_acronyms(self):
         self.assertEqual(injector.join_with_context("API keys matter.", "the value of "),
                          "API keys matter.")
+
+    def test_preserves_mixed_caps_identifiers(self):
+        self.assertEqual(injector.join_with_context("iPhone builds.", "we tested "),
+                         "iPhone builds.")
 
 
 class DictionaryTests(unittest.TestCase):
@@ -332,6 +373,14 @@ class DictionaryTests(unittest.TestCase):
         dictionary.add("Zebra")
         dictionary.add("Aardvark", starred=True)
         self.assertEqual(dictionary.bias_terms()[0], "Aardvark")
+
+    def test_corrects_casing_of_a_correctly_spelled_term(self):
+        dictionary.add("Kubernetes")
+        self.assertEqual(dictionary.correct("deploy on kubernetes"), "deploy on Kubernetes")
+
+    def test_leaves_the_users_own_capitals_alone(self):
+        dictionary.add("Kubernetes")
+        self.assertEqual(dictionary.correct("KUBERNETES rocks"), "KUBERNETES rocks")
 
     def test_auto_learn_accepts_a_spelling_fix(self):
         learned = dictionary.learn_from_correction("I emailed Anthropik today",

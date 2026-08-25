@@ -459,6 +459,16 @@ _NUM_TOKEN_RE = "|".join(
     sorted(list(_NUMBER_WORDS) + list(_NUMBER_MULTIPLIERS), key=len, reverse=True))
 _NUM_PHRASE_RE = rf"(?:{_NUM_TOKEN_RE})(?:[\s-]+(?:and[\s-]+)?(?:{_NUM_TOKEN_RE}))*"
 
+# Clock minutes are at most two words ("forty five"); an hour is always exactly
+# one ("twelve"). Both are bounded on purpose: the time patterns place two
+# number phrases next to each other, and two unbounded quantifiers there
+# backtrack catastrophically on a long run of number words. Keeping the hour to
+# a single token also stops it greedily eating the minutes — "twelve forty five
+# p m" was matching an hour of "twelve forty", failing the 1-12 range check, and
+# falling through to be summed as the number 57.
+_TIME_NUM_RE = rf"(?:{_NUM_TOKEN_RE})(?:[\s-]+(?:{_NUM_TOKEN_RE}))?"
+_HOUR_RE = rf"(?:{_NUM_TOKEN_RE}|\d{{1,2}})"
+
 
 def _phrase_value(phrase):
     return _words_to_number(re.split(r"[\s-]+", phrase.strip()))
@@ -472,7 +482,16 @@ def apply_spoken_times(text):
     if not text:
         return text
 
-    hour_re = rf"(?:{_NUM_PHRASE_RE}|\d{{1,2}})"
+    # Cheap gate: without a meridiem or "o'clock" there is no time to find, and
+    # this skips the expensive patterns for almost every transcript.
+    if not re.search(r"\b[ap]\.?\s*m\.?\b|o'?\s*clock", text, flags=re.IGNORECASE):
+        return text
+
+    # Hours and minutes are at most two words ("twelve", "forty five"), so the
+    # bounded form is used here rather than _NUM_PHRASE_RE. Two adjacent
+    # unbounded phrases make this pattern superlinear: a long run of number
+    # words with no meridiem after it took seconds to fail to match.
+    hour_re = _HOUR_RE
 
     def _fmt(hour, minute, meridiem):
         return f"{hour}:{minute:02d} {meridiem.upper()}M"
@@ -487,7 +506,7 @@ def apply_spoken_times(text):
 
     # "three thirty p m", "nine oh five a m"
     text = re.sub(
-        rf"\b(?P<h>{hour_re})\s+(?:(?:oh|o)\s+)?(?P<m>{_NUM_PHRASE_RE}|\d{{1,2}})\s*"
+        rf"\b(?P<h>{hour_re})\s+(?:(?:oh|o)\s+)?(?P<m>{_TIME_NUM_RE}|\d{{1,2}})\s*"
         r"(?P<mer>[ap])\.?\s*m\.?\b",
         _with_minutes, text, flags=re.IGNORECASE)
 
@@ -845,6 +864,24 @@ def _sanitize_llm_output(raw_input, output):
     if out_words < in_words * 0.4 and in_words > 12:
         logger.warning("Discarding LLM output: looks summarized (%d from %d words)", out_words, in_words)
         return None
+
+    # Length alone does not catch a model that answered the transcript instead
+    # of formatting it — an answer can be the same size as the question. A
+    # cleanup keeps most of the original words, so require substantial overlap.
+    if in_words > 6:
+        source_words = {w.strip(".,!?;:\"'").lower() for w in raw_input.split()}
+        result_words = [w.strip(".,!?;:\"'").lower() for w in text.split()]
+        source_words.discard("")
+        kept = sum(1 for w in result_words if w in source_words)
+        # A real cleanup keeps almost every word — overlap is typically above
+        # 0.85. Two thirds leaves room for punctuation-driven rewording while
+        # still catching a reply, which shares only the topic nouns.
+        if result_words and kept / len(result_words) < 0.66:
+            logger.warning("Discarding LLM output: only %d%% of its words came from "
+                           "the transcript — it looks like an answer, not a cleanup",
+                           int(100 * kept / len(result_words)))
+            return None
+
     return text
 
 

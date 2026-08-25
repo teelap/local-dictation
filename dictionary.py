@@ -311,6 +311,13 @@ def correct(text):
             end = word_positions[index + span - 1]
             candidate = "".join(tokens[start:end + 1])
             if candidate.lower() == term.lower():
+                # Right letters, wrong case: the dictionary defines the spelling,
+                # so "kubernetes" becomes "Kubernetes". Left alone when the user
+                # typed it in caps themselves, which is emphasis, not an error.
+                if candidate != term and candidate.islower() and not term.islower():
+                    tokens[start:end + 1] = [term]
+                    word_positions = [i for i, tok in enumerate(tokens)
+                                      if tok.isalnum() or "_" in tok]
                 index += span
                 continue
 

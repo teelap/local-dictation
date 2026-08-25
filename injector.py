@@ -244,11 +244,15 @@ def join_with_context(text, preceding=""):
     result = text
 
     if not ends_sentence and result[:1].isupper():
-        # Only lowercase an ordinary word — never an acronym or a proper noun.
+        # Only lowercase a word that looks like an ordinary sentence opener.
+        # An all-caps or mixed-caps token is an acronym or an identifier ("API",
+        # "iPhone") and must keep its shape. A capitalised ordinary word can
+        # still be a proper noun, which no amount of casing analysis will tell
+        # us apart — that residual case is accepted.
         first_word = result.split(" ", 1)[0].strip(".,!?")
-        if not first_word.isupper() and first_word.lower() == first_word.lower():
-            if len(first_word) > 1 and not first_word[1:].isupper():
-                result = result[0].lower() + result[1:]
+        if len(first_word) > 1 and not first_word.isupper() and not any(
+                char.isupper() for char in first_word[1:]):
+            result = result[0].lower() + result[1:]
 
     if preceding and not preceding[-1].isspace():
         result = " " + result
