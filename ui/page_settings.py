@@ -111,6 +111,9 @@ class SettingsPage(Page):
         self._hotkey_readouts = {}
         self._hotkey_buttons = {}
         self._capturing = None
+        # Monotonic across the page's whole life, so a listing started for one
+        # provider can be told apart from one started for the next.
+        self._llm_listing_id = 0
 
         self._scroll = w.ScrollFrame(self, theme)
         self._scroll.pack(fill=tk.BOTH, expand=True, padx=th.SPACE_XL,
@@ -589,8 +592,10 @@ class SettingsPage(Page):
         theme = self.hub.theme
         for child in self._llm_details.winfo_children():
             child.destroy()
+        # The listing token is deliberately NOT reset here. This runs on every
+        # provider change, and resetting would number every generation 1 —
+        # making the staleness check a no-op for exactly the case it exists for.
         self._llm_model_dropdown = None
-        self._llm_listing_id = 0
 
         provider = self.hub.get_config("llm_provider", llm.PROVIDER_OFF)
         if provider == llm.PROVIDER_OFF:
