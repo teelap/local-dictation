@@ -34,6 +34,18 @@ _persist = True
 # ---------------------------------------------------------------------------
 # Lifecycle
 # ---------------------------------------------------------------------------
+def set_persist(persist):
+    """Turn disk persistence on or off while the app is running.
+
+    Without this, unticking "keep history" in Settings kept writing to disk
+    until the next restart.
+    """
+    global _persist
+    _persist = bool(persist)
+    if _persist:
+        save()
+
+
 def init(app_dir, persist=True, retention_days=0):
     global _path, _persist
     _persist = persist
@@ -101,6 +113,9 @@ def _normalize(entry):
         "replacements": int(entry.get("replacements", 0) or 0),
         "mode": entry.get("mode", MODE_DICTATION),
         "reverted": bool(entry.get("reverted", False)),
+        # Set only once an entry has been reverted, so the cleaned version can
+        # be put back — "undo AI edit" is a toggle, not a one-way door.
+        "cleaned": entry.get("cleaned", ""),
     }
 
 
@@ -127,20 +142,27 @@ def add_entry(raw, text, duration=0.0, app="", app_title="", category="",
 
 
 def revert_ai_edit(entry_id):
-    """Swap an entry's cleaned text back to the raw transcript.
+    """Toggle an entry between its cleaned text and the raw transcript.
 
-    Returns the raw text so the caller can re-paste it, or None if not found.
+    Both versions are kept, so this is reversible in either direction — undoing
+    a cleanup you did not like should not cost you the cleanup.
+
+    Returns the text now active, or None if the entry is gone.
     """
     with _lock:
         for entry in _entries:
-            if entry["id"] == entry_id:
-                if entry["reverted"]:
-                    return entry["text"]
-                entry["text"], entry["raw"] = entry["raw"], entry["raw"]
+            if entry["id"] != entry_id:
+                continue
+            if entry["reverted"]:
+                entry["text"] = entry.get("cleaned") or entry["text"]
+                entry["reverted"] = False
+            else:
+                entry["cleaned"] = entry["text"]
+                entry["text"] = entry["raw"]
                 entry["reverted"] = True
-                entry["words"] = len(entry["text"].split())
-                save()
-                return entry["text"]
+            entry["words"] = len(entry["text"].split())
+            save()
+            return entry["text"]
     return None
 
 

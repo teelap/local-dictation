@@ -55,6 +55,7 @@ class StylesPage(Page):
         self._build_per_app(self._scroll.body)
         self._build_context(self._scroll.body)
         self._build_instructions(self._scroll.body)
+        self._build_replacements(self._scroll.body)
 
     # ------------------------------------------------------------------
     def on_show(self):
@@ -62,6 +63,81 @@ class StylesPage(Page):
         self._sync_styles()
         self._sync_context()
         self._sync_instructions()
+        self._sync_replacements()
+
+    # ------------------------------------------------------------------
+    # 5. Text replacements
+    # ------------------------------------------------------------------
+    def _build_replacements(self, parent):
+        """Plain find/replace rules.
+
+        These survive from the previous version of the app, where they had their
+        own tab. They still run on every dictation, so they need an editor —
+        rules the user cannot see or remove are worse than no rules.
+        """
+        theme = self.hub.theme
+        body = self._section(
+            parent, "Text replacements",
+            "Literal find-and-replace, applied to every dictation before "
+            "punctuation and capitalization.",
+            height=316)
+
+        self._replacements = w.TextArea(body, theme, height=5, bg="surface")
+        self._replacements.pack(fill=tk.X)
+        self._saved_replacements = ""
+
+        w.Label(body, theme, role="ink_faint", size=9, bg="surface",
+                wraplength=WRAP, justify=tk.LEFT, anchor="w",
+                text="One rule per line, written as  find -> replace.  For example: "
+                     "“ok -> OK”. Matching ignores case and only whole words count. "
+                     "For names and jargon, prefer the Dictionary — it also improves "
+                     "recognition rather than just fixing the text afterwards."
+                ).pack(anchor="w", fill=tk.X, pady=(6, th.SPACE_SM))
+
+        w.Button(body, theme, text="Save replacements", size=9, height=32,
+                 bg="surface", command=self._save_replacements).pack(anchor="w")
+
+    @staticmethod
+    def _format_replacements(mapping):
+        return "\n".join(f"{find} -> {replace}" for find, replace in mapping.items())
+
+    @staticmethod
+    def _parse_replacements(text):
+        rules = {}
+        for line in (text or "").splitlines():
+            if "->" not in line:
+                continue
+            find, _, replace = line.partition("->")
+            find = find.strip()
+            if find:
+                rules[find] = replace.strip()
+        return rules
+
+    def _sync_replacements(self):
+        stored = self._format_replacements(
+            self.hub.get_config("word_substitutions", {}) or {})
+        try:
+            current = self._replacements.get()
+        except tk.TclError:
+            return
+        # Same rule as the instruction box: never clobber an unsaved edit.
+        if current == self._saved_replacements:
+            self._replacements.set(stored)
+            self._saved_replacements = stored
+
+    def _save_replacements(self):
+        try:
+            raw = self._replacements.get()
+        except tk.TclError as e:
+            logger.warning("Could not read the replacements box: %s", e)
+            self.hub.toast("Could not read that text.")
+            return
+
+        rules = self._parse_replacements(raw)
+        if self._save("word_substitutions", rules):
+            self._saved_replacements = raw
+            self.hub.toast(f"Saved {len(rules)} replacement"
+                           f"{'' if len(rules) == 1 else 's'}.")
 
     # ------------------------------------------------------------------
     # Section scaffolding

@@ -25,6 +25,10 @@ DEFAULT_RESTORE_DELAY = 0.25
 _last_transcript = ""
 _last_lock = threading.Lock()
 
+# Clipboard restores run on a short timer; quitting has to wait for them.
+_pending_restores = []
+_pending_lock = threading.Lock()
+
 # Trailing voice commands that fire a keystroke after the text is inserted.
 # Recognised only at the very end of a dictation — mid-sentence they are words.
 _TRAILING_ACTIONS = [
@@ -151,9 +155,30 @@ def paste_text(text, restore_delay=DEFAULT_RESTORE_DELAY, restore_clipboard=True
             time.sleep(restore_delay)
             write_clipboard(saved)
 
-        threading.Thread(target=_restore, daemon=True, name="clipboard-restore").start()
+        thread = threading.Thread(target=_restore, daemon=True,
+                                  name="clipboard-restore")
+        with _pending_lock:
+            _pending_restores.append(thread)
+        thread.start()
 
     return True
+
+
+def flush_pending(timeout=1.0):
+    """Wait for outstanding clipboard restores before the process exits.
+
+    Quitting immediately after a dictation would otherwise leave the transcript
+    in the clipboard, having borrowed it and never given it back.
+    """
+    with _pending_lock:
+        threads = [t for t in _pending_restores if t.is_alive()]
+        _pending_restores.clear()
+    deadline = time.monotonic() + timeout
+    for thread in threads:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        thread.join(remaining)
 
 
 def type_text(text, interval=0.01):

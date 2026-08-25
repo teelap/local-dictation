@@ -703,9 +703,15 @@ class SettingsPage(Page):
         self._toggle_row(body, "output.trailing_actions", True, "Trailing actions",
                          'Honour "press enter" or "new line" at the end of a '
                          "dictation instead of typing the words.")
-        self._toggle_row(body, "output.seam_aware", True, "Match the surrounding text",
-                         "Capitalise and space to fit what is already around the "
-                         "cursor.")
+        # Replaces a "match the surrounding text" toggle that controlled nothing
+        # — matching the seam needs to read text at the cursor, which this app
+        # deliberately does not do. Auto-stop is a real control that was missing.
+        self._number_row(
+            body, "audio.silence_threshold_seconds", 0.0, "Stop after silence",
+            "Seconds of quiet that end a hands-free session. 0 never stops on "
+            "its own. Holding the key is unaffected.",
+            parse=lambda v: max(0.0, min(60.0, float(v))),
+            format_value=lambda v: f"{float(v or 0):.1f}")
 
         w.Label(body, theme, text="Insertion method", size=11, weight="bold",
                 bg="surface").pack(anchor="w", pady=(th.SPACE_SM, 4))

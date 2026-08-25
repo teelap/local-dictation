@@ -79,9 +79,8 @@ DEFAULT_CONFIG = {
         "paste_mode": "clipboard",            # "clipboard" or "type"
         "restore_clipboard": True,
         "clipboard_restore_delay": 0.25,
-        "trailing_space": True,
+        "trailing_space": True,               # the single source of truth
         "trailing_actions": True,             # honour "press enter"
-        "seam_aware": True,                   # match surrounding text
     },
 
     # ---- Formatting ----------------------------------------------------
@@ -89,7 +88,6 @@ DEFAULT_CONFIG = {
         "cleanup_level": "medium",            # none | light | medium | high
         "custom_instructions": "",
         "writing_samples": [],
-        "trailing_space": True,
     },
     "word_substitutions": {},
 
@@ -194,6 +192,9 @@ def _migrate(data):
         migrated["hotkeys"]["push_to_talk"] = ""
 
     migrated.pop("show_history", None)
+    # An existing config means an existing user; do not put them through the
+    # first-run wizard on upgrade.
+    migrated.setdefault("first_run_complete", True)
     migrated["config_version"] = CONFIG_VERSION
     return migrated, True
 

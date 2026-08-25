@@ -120,7 +120,9 @@ def transcribe_audio(file_path, language=None, language_pool=None,
     if _model is None:
         raise RuntimeError("Model not initialized. Call init_model() first.")
 
-    result_info = {"language": None, "duration": 0.0}
+    # "error" distinguishes a failure from genuine silence — without it the
+    # caller reports a crashed transcription as "no speech detected".
+    result_info = {"language": None, "duration": 0.0, "error": None}
 
     try:
         if not language:
@@ -158,8 +160,9 @@ def transcribe_audio(file_path, language=None, language_pool=None,
         logger.debug("Transcribed (%s): %s", result_info["language"], text[:120])
         return text, result_info
 
-    except Exception as e:
-        logger.error("Transcription error: %s", e)
+    except Exception as e:  # noqa: BLE001 — surfaced to the user via result_info
+        logger.exception("Transcription error: %s", e)
+        result_info["error"] = str(e)
         return "", result_info
 
     finally:

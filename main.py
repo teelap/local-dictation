@@ -394,6 +394,13 @@ class DictationApp:
         self._play_sound(start=True)
 
         audio_config = dict(self.config.get("audio") or {})
+        if not self._latched:
+            # Auto-stop on silence only makes sense hands-free. While the key is
+            # held, a pause for thought is not the end of the dictation — and an
+            # upgraded config carries this value over from the old toggle-only
+            # model, where it always applied.
+            audio_config["silence_threshold_seconds"] = 0.0
+
         started = audio_mod.start_recording(
             sample_rate=audio_config.get("sample_rate", 16000),
             device_index=audio_config.get("device_index"),
@@ -483,7 +490,10 @@ class DictationApp:
                 logger.info("Nothing captured")
                 return
 
-            raw = self._transcribe(wav_path)
+            raw, info = self._transcribe(wav_path)
+            if info.get("error"):
+                self.tray.notify("Transcription failed", str(info["error"])[:140])
+                return
             if not raw:
                 logger.info("No speech detected")
                 return
@@ -514,13 +524,13 @@ class DictationApp:
             terms = dictionary_mod.bias_terms()
             hotwords = " ".join(terms) if terms else None
 
-        text, _info = transcription_mod.transcribe_audio(
+        text, info = transcription_mod.transcribe_audio(
             wav_path,
             language=self.config.get("language"),
             language_pool=self.config.get("language_pool"),
             initial_prompt=prompt,
             hotwords=hotwords)
-        return (text or "").strip()
+        return (text or "").strip(), info
 
     def _handle_dictation(self, raw, duration):
         app_context = context_mod.resolve(self.config)
@@ -764,6 +774,8 @@ class DictationApp:
         if self._model_ready.is_set():
             self._register_hotkeys()
 
+        history_mod.set_persist(self.config.get("history_persist", True))
+
         self.overlay.set_enabled((self.config.get("ui") or {}).get("show_overlay", True))
         if self.tray:
             self.tray.refresh_menu()
@@ -807,6 +819,10 @@ class DictationApp:
         if self._recording:
             audio_mod.discard_recording()
         save_config(self.config)
+        # A paste borrows the clipboard and hands it back on a short timer.
+        # os._exit skips that thread, so quitting right after dictating would
+        # otherwise leave the transcript sitting in the user's clipboard.
+        injector.flush_pending()
         if self.tray:
             self.tray.stop()
         try:

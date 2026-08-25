@@ -236,7 +236,7 @@ class FormatOptions:
                 resolve_self_corrections=False, auto_capitalize=False,
                 auto_punctuate=False, smart_numbers=False, spoken_symbols=False,
                 smart_quotes=False, use_llm=False,
-                trailing_space=bool(fmt.get("trailing_space", True)),
+                trailing_space=bool((config.get("output") or {}).get("trailing_space", True)),
                 substitutions={},
             )
 
@@ -249,7 +249,10 @@ class FormatOptions:
             smart_numbers=bool(pick("smart_numbers", True)),
             spoken_symbols=bool(pick("spoken_symbols", True)),
             smart_quotes=bool(pick("smart_quotes", False)),
-            trailing_space=bool(pick("trailing_space", True)),
+            # Trailing space lives under `output` — it is an insertion concern,
+            # and having it in two places meant the Settings toggle wrote a key
+            # the formatter never read.
+            trailing_space=bool((config.get("output") or {}).get("trailing_space", True)),
             use_llm=bool(pick("use_llm", False)) and llm.is_enabled(config),
             tone=str(pick("tone", "neutral")),
             custom_instructions=str(pick("custom_instructions", "") or ""),

@@ -16,6 +16,7 @@ from datetime import date, timedelta
 
 import context
 import dictionary
+import history
 import formatter
 import injector
 import snippets
@@ -452,6 +453,78 @@ class SnippetTests(unittest.TestCase):
         snippets.add("standup", "Yesterday:\n  - shipped\nToday:")
         text, _ = snippets.expand("here is the standup")
         self.assertIn("\n  - shipped\n", text)
+
+
+class HistoryTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        history.init(self.dir)
+        history.clear()
+
+    def tearDown(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def test_revert_ai_edit_is_reversible(self):
+        """Regression: reverting overwrote the cleaned text, so there was no redo."""
+        entry = history.add_entry(raw="um ship it friday", text="Ship it Friday.")
+        self.assertEqual(history.revert_ai_edit(entry["id"]), "um ship it friday")
+        self.assertEqual(history.revert_ai_edit(entry["id"]), "Ship it Friday.")
+        self.assertEqual(history.revert_ai_edit(entry["id"]), "um ship it friday")
+
+    def test_revert_keeps_the_raw_transcript(self):
+        entry = history.add_entry(raw="um ship it friday", text="Ship it Friday.")
+        history.revert_ai_edit(entry["id"])
+        self.assertEqual(history.get_entry(entry["id"])["raw"], "um ship it friday")
+
+    def test_persistence_can_be_turned_off_at_runtime(self):
+        history.set_persist(False)
+        history.add_entry(raw="a", text="a")
+        history.set_persist(True)
+        self.assertTrue(history.get_entries())
+
+
+class ConfigTests(unittest.TestCase):
+    """The old flat config has to survive an upgrade without surprising anyone."""
+
+    OLD = {
+        "trigger_hotkey": "ctrl+shift+f12", "model_size": "small.en",
+        "device": "cuda", "paste_mode": "type", "interaction_mode": "toggle",
+        "silence_threshold_seconds": 3.0, "audio_device_index": 4,
+        "word_substitutions": {"teh": "the"}, "launch_at_startup": True,
+        "show_history": True, "history_persist": True,
+    }
+
+    def _migrate(self):
+        import config_manager
+
+        migrated, _ = config_manager._migrate(dict(self.OLD))
+        return config_manager._deep_merge(config_manager.DEFAULT_CONFIG, migrated)
+
+    def test_toggle_mode_becomes_the_hands_free_binding(self):
+        config = self._migrate()
+        self.assertEqual(config["hotkeys"]["hands_free"], "ctrl+shift+f12")
+        self.assertEqual(config["hotkeys"]["push_to_talk"], "")
+
+    def test_choices_are_preserved(self):
+        config = self._migrate()
+        self.assertEqual(config["model_size"], "small.en")
+        self.assertEqual(config["device"], "cuda")
+        self.assertEqual(config["output"]["paste_mode"], "type")
+        self.assertEqual(config["audio"]["device_index"], 4)
+        self.assertEqual(config["word_substitutions"], {"teh": "the"})
+        self.assertTrue(config["launch_at_startup"])
+
+    def test_upgraders_skip_the_first_run_wizard(self):
+        """An existing config means an existing user."""
+        self.assertTrue(self._migrate()["first_run_complete"])
+
+    def test_trailing_space_has_one_home(self):
+        """Regression: the Settings toggle wrote a key the formatter never read."""
+        config = self._migrate()
+        self.assertIn("trailing_space", config["output"])
+        self.assertNotIn("trailing_space", config["formatting"])
+        self.assertFalse(
+            FormatOptions.from_config({"output": {"trailing_space": False}}).trailing_space)
 
 
 class PerformanceTests(unittest.TestCase):
