@@ -1,200 +1,302 @@
-"""Transcription history — in-memory store with optional JSON persistence."""
+"""Transcript history — the record of what was said and what was typed.
 
+Every entry stores **both** the raw transcript and the cleaned text. That is the
+single most important trust feature in the whole app: it means "undo AI edit" is
+always possible, the user can see exactly what the formatter changed, and a
+cleanup pass that gets something wrong is recoverable rather than silent.
+
+This module is the data layer only — the browsing UI lives in the Flow Hub.
+"""
+
+import csv
+import io
 import json
-import os
-import threading
 import logging
-import tkinter as tk
-from tkinter import ttk
-from datetime import datetime
+import os
+import re
+import threading
+import uuid
+from datetime import datetime, timedelta
 
 logger = logging.getLogger(__name__)
 
-MAX_ENTRIES = 50
+MAX_ENTRIES = 2000
 
-_lock = threading.Lock()
-_entries = []          # list of dicts: {timestamp, duration, text}
-_persist_path = None   # set by init()
-_persist_enabled = False
+MODE_DICTATION = "dictation"
+MODE_COMMAND = "command"
 
-
-def init(app_dir, persist=True):
-    """Initialize the history module.
-
-    Args:
-        app_dir: Directory where history.json is stored.
-        persist: Whether to save/load history from disk.
-    """
-    global _persist_path, _persist_enabled
-    _persist_enabled = persist
-    _persist_path = os.path.join(app_dir, "history.json")
-    if persist and os.path.exists(_persist_path):
-        _load_from_disk()
+_lock = threading.RLock()
+_entries = []
+_path = None
+_persist = True
 
 
-def _load_from_disk():
+# ---------------------------------------------------------------------------
+# Lifecycle
+# ---------------------------------------------------------------------------
+def init(app_dir, persist=True, retention_days=0):
+    global _path, _persist
+    _persist = persist
+    _path = os.path.join(app_dir, "history.json")
+    if persist and os.path.exists(_path):
+        load()
+    if retention_days:
+        prune(retention_days)
+
+
+def load():
     global _entries
     try:
-        with open(_persist_path, "r", encoding="utf-8") as f:
+        with open(_path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        with _lock:
-            _entries = data[-MAX_ENTRIES:]
-        logger.info("Loaded %d history entries from disk", len(_entries))
-    except Exception as e:
-        logger.warning("Could not load history from disk: %s", e)
+        if isinstance(data, list):
+            with _lock:
+                _entries = [_normalize(e) for e in data][-MAX_ENTRIES:]
+            logger.info("Loaded %d history entries", len(_entries))
+    except (OSError, json.JSONDecodeError) as e:
+        logger.warning("Could not load history: %s", e)
 
 
-def _save_to_disk():
-    if not _persist_enabled or _persist_path is None:
+def save():
+    if not _persist or not _path:
         return
     try:
         with _lock:
-            snapshot = list(_entries)
-        with open(_persist_path, "w", encoding="utf-8") as f:
-            json.dump(snapshot, f, indent=2, ensure_ascii=False)
-    except Exception as e:
-        logger.warning("Could not save history to disk: %s", e)
+            payload = json.dumps(list(_entries), indent=2, ensure_ascii=False)
+        temp_path = _path + ".tmp"
+        with open(temp_path, "w", encoding="utf-8") as f:
+            f.write(payload)
+        os.replace(temp_path, _path)
+    except OSError as e:
+        logger.warning("Could not save history: %s", e)
 
 
-def add_entry(text, duration_seconds):
-    """Add a transcription entry to the history."""
-    entry = {
-        "timestamp": datetime.now().isoformat(timespec="seconds"),
-        "duration": round(duration_seconds, 1),
+def _normalize(entry):
+    """Fill in fields added after an entry was written, so old files still load."""
+    text = entry.get("text", "")
+    return {
+        "id": entry.get("id") or uuid.uuid4().hex[:12],
+        "timestamp": entry.get("timestamp") or datetime.now().isoformat(timespec="seconds"),
+        "duration": float(entry.get("duration", 0.0) or 0.0),
+        "raw": entry.get("raw", text),
         "text": text,
+        "app": entry.get("app", ""),
+        "app_title": entry.get("app_title", ""),
+        "category": entry.get("category", ""),
+        "cleanup_level": entry.get("cleanup_level", ""),
+        "used_llm": bool(entry.get("used_llm", False)),
+        "words": int(entry.get("words") or len(text.split())),
+        "cleaned_words": int(entry.get("cleaned_words", 0) or 0),
+        "replacements": int(entry.get("replacements", 0) or 0),
+        "mode": entry.get("mode", MODE_DICTATION),
+        "reverted": bool(entry.get("reverted", False)),
     }
+
+
+# ---------------------------------------------------------------------------
+# Writing
+# ---------------------------------------------------------------------------
+def add_entry(raw, text, duration=0.0, app="", app_title="", category="",
+              cleanup_level="", used_llm=False, cleaned_words=0, replacements=0,
+              mode=MODE_DICTATION):
+    """Record one dictation. Returns the stored entry."""
+    entry = _normalize({
+        "raw": raw, "text": text, "duration": duration, "app": app,
+        "app_title": app_title, "category": category, "cleanup_level": cleanup_level,
+        "used_llm": used_llm, "cleaned_words": cleaned_words,
+        "replacements": replacements, "mode": mode,
+    })
     with _lock:
         _entries.append(entry)
         if len(_entries) > MAX_ENTRIES:
-            _entries.pop(0)
-    _save_to_disk()
-    logger.debug("History entry added: %s", text[:60])
+            del _entries[:len(_entries) - MAX_ENTRIES]
+    save()
+    logger.debug("History: %s", text[:60])
+    return entry
 
 
-def get_entries():
-    """Return a copy of all history entries (newest last)."""
+def revert_ai_edit(entry_id):
+    """Swap an entry's cleaned text back to the raw transcript.
+
+    Returns the raw text so the caller can re-paste it, or None if not found.
+    """
     with _lock:
-        return list(_entries)
+        for entry in _entries:
+            if entry["id"] == entry_id:
+                if entry["reverted"]:
+                    return entry["text"]
+                entry["text"], entry["raw"] = entry["raw"], entry["raw"]
+                entry["reverted"] = True
+                entry["words"] = len(entry["text"].split())
+                save()
+                return entry["text"]
+    return None
 
 
-# ---- Tkinter History Window ----
-
-_history_window = None
-_history_window_lock = threading.Lock()
-
-
-class HistoryWindow:
-    def __init__(self):
-        self.root = tk.Toplevel()
-        self.root.title("Transcription History")
-        self.root.geometry("680x480")
-        self.root.attributes("-topmost", False)
-        self.root.resizable(True, True)
-        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
-
-        self._build_ui()
-        self._populate()
-
-    def _build_ui(self):
-        top_bar = tk.Frame(self.root)
-        top_bar.pack(fill=tk.X, padx=8, pady=(8, 4))
-        tk.Label(top_bar, text="Transcription History", font=("Helvetica", 12, "bold")).pack(side=tk.LEFT)
-        tk.Button(top_bar, text="Refresh", command=self._populate).pack(side=tk.RIGHT)
-        tk.Button(top_bar, text="Clear All", command=self._clear_all).pack(side=tk.RIGHT, padx=4)
-
-        # Scrollable container
-        container = tk.Frame(self.root)
-        container.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
-
-        self._canvas = tk.Canvas(container)
-        scrollbar = ttk.Scrollbar(container, orient="vertical", command=self._canvas.yview)
-        self._scrollable_frame = tk.Frame(self._canvas)
-        self._scrollable_frame.bind(
-            "<Configure>",
-            lambda e: self._canvas.configure(scrollregion=self._canvas.bbox("all"))
-        )
-        self._canvas_window = self._canvas.create_window((0, 0), window=self._scrollable_frame, anchor="nw")
-        self._canvas.configure(yscrollcommand=scrollbar.set)
-        self._canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
-
-        # Make canvas width track window width
-        self._canvas.bind("<Configure>", self._on_canvas_resize)
-
-    def _on_canvas_resize(self, event):
-        self._canvas.itemconfig(self._canvas_window, width=event.width)
-
-    def _populate(self):
-        # Clear existing widgets
-        for widget in self._scrollable_frame.winfo_children():
-            widget.destroy()
-
-        entries = get_entries()
-        if not entries:
-            tk.Label(self._scrollable_frame, text="No history yet.", fg="gray").pack(pady=20)
-            return
-
-        # Show newest first
-        for entry in reversed(entries):
-            self._add_entry_widget(entry)
-
-    def _add_entry_widget(self, entry):
-        frame = tk.Frame(self._scrollable_frame, bd=1, relief=tk.GROOVE)
-        frame.pack(fill=tk.X, padx=4, pady=3)
-
-        meta = tk.Frame(frame)
-        meta.pack(fill=tk.X, padx=6, pady=(4, 0))
-        tk.Label(meta, text=entry.get("timestamp", ""), fg="gray", font=("Helvetica", 8)).pack(side=tk.LEFT)
-        duration = entry.get("duration", 0)
-        tk.Label(meta, text=f"{duration}s", fg="gray", font=("Helvetica", 8)).pack(side=tk.LEFT, padx=8)
-
-        text_var = tk.StringVar(value=entry.get("text", ""))
-        text_label = tk.Label(frame, textvariable=text_var, wraplength=540,
-                               justify=tk.LEFT, anchor="w", font=("Helvetica", 10))
-        text_label.pack(fill=tk.X, padx=6, pady=(2, 4))
-
-        def copy_to_clipboard(t=entry.get("text", "")):
-            self.root.clipboard_clear()
-            self.root.clipboard_append(t)
-
-        tk.Button(frame, text="Copy", command=copy_to_clipboard,
-                  font=("Helvetica", 8), padx=4).pack(side=tk.RIGHT, padx=4, pady=(0, 4))
-
-    def _clear_all(self):
-        global _entries
-        with _lock:
-            _entries.clear()
-        _save_to_disk()
-        self._populate()
-
-    def _on_close(self):
-        global _history_window
-        with _history_window_lock:
-            _history_window = None
-        self.root.destroy()
+def update_text(entry_id, text):
+    """Edit an entry's text in place — used when the user fixes a transcript."""
+    with _lock:
+        for entry in _entries:
+            if entry["id"] == entry_id:
+                entry["text"] = text
+                entry["words"] = len(text.split())
+                save()
+                return True
+    return False
 
 
-def open_history_window(parent_root=None):
-    """Open or focus the history window. Safe to call from any thread via after()."""
-    global _history_window
+def delete(entry_id):
+    with _lock:
+        before = len(_entries)
+        _entries[:] = [e for e in _entries if e["id"] != entry_id]
+        changed = len(_entries) != before
+    if changed:
+        save()
+    return changed
 
-    def _open():
-        global _history_window
-        with _history_window_lock:
-            if _history_window is not None:
-                try:
-                    _history_window.root.lift()
-                    _history_window.root.focus_force()
-                    return
-                except Exception:
-                    _history_window = None
-            _history_window = HistoryWindow()
 
-    if parent_root is not None:
-        parent_root.after(0, _open)
-    else:
-        # Called from non-Tk thread — create a hidden root if needed
+def clear():
+    with _lock:
+        _entries.clear()
+    save()
+
+
+def prune(retention_days):
+    """Drop entries older than the retention window. 0 keeps everything."""
+    if not retention_days:
+        return 0
+    cutoff = datetime.now() - timedelta(days=retention_days)
+    with _lock:
+        before = len(_entries)
+        kept = []
+        for entry in _entries:
+            try:
+                stamp = datetime.fromisoformat(entry["timestamp"])
+            except (ValueError, KeyError):
+                kept.append(entry)     # unparseable timestamp: keep it
+                continue
+            if stamp >= cutoff:
+                kept.append(entry)
+        _entries[:] = kept
+        removed = before - len(_entries)
+    if removed:
+        save()
+        logger.info("Pruned %d history entries older than %d days", removed, retention_days)
+    return removed
+
+
+# ---------------------------------------------------------------------------
+# Reading
+# ---------------------------------------------------------------------------
+def get_entries(newest_first=True):
+    with _lock:
+        entries = [dict(e) for e in _entries]
+    return list(reversed(entries)) if newest_first else entries
+
+
+def get_entry(entry_id):
+    with _lock:
+        for entry in _entries:
+            if entry["id"] == entry_id:
+                return dict(entry)
+    return None
+
+
+def latest():
+    with _lock:
+        return dict(_entries[-1]) if _entries else None
+
+
+def search(query, category=None, mode=None):
+    """Filter history by free text, category, and mode.
+
+    Matching is on whole words where possible so searching "the" does not return
+    every entry containing "there".
+    """
+    entries = get_entries()
+    query = (query or "").strip()
+
+    if category:
+        entries = [e for e in entries if e["category"] == category]
+    if mode:
+        entries = [e for e in entries if e["mode"] == mode]
+
+    if not query:
+        return entries
+
+    try:
+        pattern = re.compile(re.escape(query), re.IGNORECASE)
+    except re.error:
+        return entries
+
+    return [e for e in entries
+            if pattern.search(e["text"]) or pattern.search(e["raw"])
+            or pattern.search(e["app"])]
+
+
+def group_by_day(entries=None):
+    """Group entries under Today / Yesterday / explicit dates, newest first."""
+    entries = entries if entries is not None else get_entries()
+    today = datetime.now().date()
+    groups = []
+    index = {}
+
+    for entry in entries:
         try:
-            _open()
-        except Exception as e:
-            logger.warning("Could not open history window: %s", e)
+            stamp = datetime.fromisoformat(entry["timestamp"]).date()
+        except (ValueError, KeyError):
+            stamp = today
+
+        delta = (today - stamp).days
+        if delta == 0:
+            label = "Today"
+        elif delta == 1:
+            label = "Yesterday"
+        else:
+            label = stamp.strftime("%B %d, %Y")
+
+        if label not in index:
+            index[label] = []
+            groups.append((label, index[label]))
+        index[label].append(entry)
+
+    return groups
+
+
+# ---------------------------------------------------------------------------
+# Export
+# ---------------------------------------------------------------------------
+def export(fmt="txt", entries=None):
+    """Serialise history as plain text, JSON, or CSV."""
+    entries = entries if entries is not None else get_entries(newest_first=False)
+
+    if fmt == "json":
+        return json.dumps(entries, indent=2, ensure_ascii=False)
+
+    if fmt == "csv":
+        buffer = io.StringIO()
+        fields = ["timestamp", "duration", "app", "category", "mode",
+                  "words", "used_llm", "text", "raw"]
+        writer = csv.DictWriter(buffer, fieldnames=fields, extrasaction="ignore")
+        writer.writeheader()
+        for entry in entries:
+            writer.writerow(entry)
+        return buffer.getvalue()
+
+    lines = []
+    for entry in entries:
+        lines.append(f"[{entry['timestamp']}] ({entry['duration']:.1f}s"
+                     + (f", {entry['app']}" if entry["app"] else "") + ")")
+        lines.append(entry["text"])
+        lines.append("")
+    return "\n".join(lines)
+
+
+def stats_snapshot():
+    """Quick counts for the Home page header."""
+    entries = get_entries()
+    return {
+        "count": len(entries),
+        "words": sum(e["words"] for e in entries),
+        "with_llm": sum(1 for e in entries if e["used_llm"]),
+    }

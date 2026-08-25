@@ -1,216 +1,437 @@
-"""Pill-shaped always-on-top overlay with live audio meter."""
+"""The floating recording pill — the visual anchor of the dictation loop.
 
-import math
-import random
-import threading
-import tkinter as tk
-import ctypes
+There is no text field to watch while you speak, so this bar carries all the
+feedback. Its most important job is diagnostic, and it comes from two separate
+signals drawn at once:
+
+* **Bar height** follows raw amplitude — proof the stream is open.
+* **Bar colour** follows voice activity — proof it is hearing *you*.
+
+Bars that move but never light up mean the mic is picking up a room, not a
+person. A bar that never appears at all means the hotkey never fired. That
+distinction is the difference between a two-minute wasted dictation and an
+immediate fix.
+
+The pill is draggable to three edge docks and remembers where it was put — the
+single loudest complaint about tools like this is an overlay that sits on top of
+the button you were trying to press.
+"""
+
 import logging
+import math
+import sys
+import time
+import tkinter as tk
 
 import audio as audio_mod
 
 logger = logging.getLogger(__name__)
 
-# ── Layout ────────────────────────────────────────────────────────────────────
-W, H       = 122, 48
-RADIUS     = H // 2          # 24 — full pill end-caps
+# States
+STATE_HIDDEN = "hidden"
+STATE_RECORDING = "recording"
+STATE_TRANSCRIBING = "transcribing"
+STATE_COMMAND = "command"
 
-BAR_COUNT  = 7
-BAR_W      = 4
-BAR_GAP    = 3
-BAR_MAX_H  = 30
-BAR_MIN_H  = 3
-BARS_LEFT  = RADIUS           # first bar starts right after left cap
-BARS_TOTAL = BAR_COUNT * BAR_W + (BAR_COUNT - 1) * BAR_GAP   # 46 px
+# Geometry
+PILL_W, PILL_H = 148, 46
+BAR_COUNT = 9
+BAR_W = 4
+BAR_GAP = 3
+BAR_MAX = 26
+BAR_MIN = 3
 
-# Red dot sits to the right of the bars
-DOT_CX     = BARS_LEFT + BARS_TOTAL + 10   # 80
-DOT_CY     = H // 2                         # 24
-DOT_R      = 6
+DOCK_BOTTOM = "bottom"
+DOCK_LEFT = "left"
+DOCK_RIGHT = "right"
+DOCK_MARGIN = 40
 
-# ── Colours ───────────────────────────────────────────────────────────────────
-BG        = '#1c1c1e'
-RED       = '#ff453a'
-ORANGE    = '#ff9f0a'
-
-
-def _apply_pill_region(hwnd, w, h):
-    gdi32  = ctypes.windll.gdi32
-    user32 = ctypes.windll.user32
-    hrgn = gdi32.CreateRoundRectRgn(0, 0, w + 1, h + 1, h, h)
-    user32.SetWindowRgn(hwnd, hrgn, True)
+FRAME_MS = 40          # ~25 fps; enough for a waveform, cheap enough to ignore
 
 
-def _apply_layered_alpha(hwnd, alpha=0.93):
-    user32        = ctypes.windll.user32
-    GWL_EXSTYLE   = -20
-    WS_EX_LAYERED = 0x00080000
-    LWA_ALPHA     = 0x00000002
-    style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-    user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style | WS_EX_LAYERED)
-    user32.SetLayeredWindowAttributes(hwnd, 0, int(alpha * 255), LWA_ALPHA)
+def _apply_window_effects(root, width, height, alpha=0.96):
+    """Round the window, make it translucent, and keep it off the taskbar.
 
+    Windows-only; everything here degrades to a plain borderless window
+    elsewhere, which is enough for the overlay to remain usable.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
 
-def _apply_click_through(hwnd):
-    user32            = ctypes.windll.user32
-    GWL_EXSTYLE       = -20
-    WS_EX_LAYERED     = 0x00080000
-    WS_EX_TRANSPARENT = 0x00000020
-    style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
-    user32.SetWindowLongW(hwnd, GWL_EXSTYLE,
-                          style | WS_EX_LAYERED | WS_EX_TRANSPARENT)
+        hwnd = ctypes.windll.user32.GetParent(root.winfo_id()) or root.winfo_id()
+        gdi32, user32 = ctypes.windll.gdi32, ctypes.windll.user32
+
+        region = gdi32.CreateRoundRectRgn(0, 0, width + 1, height + 1, height, height)
+        user32.SetWindowRgn(hwnd, region, True)
+
+        GWL_EXSTYLE = -20
+        WS_EX_LAYERED = 0x00080000
+        WS_EX_TOOLWINDOW = 0x00000080    # keeps it out of Alt-Tab and the taskbar
+        WS_EX_NOACTIVATE = 0x08000000    # clicking it must not steal focus
+        LWA_ALPHA = 0x00000002
+
+        style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+        user32.SetWindowLongW(hwnd, GWL_EXSTYLE,
+                              style | WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)
+        user32.SetLayeredWindowAttributes(hwnd, 0, int(alpha * 255), LWA_ALPHA)
+    except Exception as e:  # noqa: BLE001 — cosmetic only
+        logger.debug("Window effects unavailable: %s", e)
 
 
 class RecordingOverlay:
-    def __init__(self):
-        self._root    = None
-        self._canvas  = None
+    """A borderless Toplevel that animates the live input level.
+
+    It shares the application's single Tk root rather than creating one of its
+    own — a second root in the same process makes window ownership and teardown
+    unpredictable. Public methods are safe to call from worker threads; each one
+    marshals onto the Tk thread with ``after``.
+    """
+
+    def __init__(self, master, config=None, on_stop=None, on_cancel=None,
+                 on_settings=None):
+        self._config = config or {}
+        self._on_stop = on_stop
+        self._on_cancel = on_cancel
+        self._on_settings = on_settings
+
+        self._root = None
+        self._canvas = None
         self._bar_ids = []
-        self._dot_id  = None
-        self._heights = [float(BAR_MIN_H)] * BAR_COUNT
-        self._targets = [float(BAR_MIN_H)] * BAR_COUNT
-        self._state   = 'hidden'
-        self._phase   = 0.0
-        self._ready   = threading.Event()
+        self._dot_id = None
+        self._heights = [float(BAR_MIN)] * BAR_COUNT
+        self._targets = [float(BAR_MIN)] * BAR_COUNT
+        self._state = STATE_HIDDEN
+        self._phase = 0.0
 
-        t = threading.Thread(target=self._run, daemon=True, name="overlay")
-        t.start()
-        self._ready.wait(timeout=5)
+        self._dock = (self._config.get("ui") or {}).get("overlay_dock", DOCK_BOTTOM)
+        self._vertical = self._dock in (DOCK_LEFT, DOCK_RIGHT)
+        self._drag_origin = None
+        self._hidden_until = float((self._config.get("ui") or {}).get(
+            "overlay_hidden_until", 0.0) or 0.0)
 
-    # ── Tk thread ─────────────────────────────────────────────────────────────
+        self._build(master)
 
-    def _run(self):
+    def _build(self, master):
         try:
-            root = tk.Tk()
+            root = tk.Toplevel(master)
             self._root = root
-
             root.overrideredirect(True)
-            root.wm_attributes('-topmost', True)
-            root.configure(bg=BG)
+            root.wm_attributes("-topmost", True)
+            root.configure(bg=self._palette()["bg"])
 
-            sw = root.winfo_screenwidth()
-            sh = root.winfo_screenheight()
-            root.geometry(f'{W}x{H}+{(sw - W) // 2}+{sh - H - 80}')
+            self._canvas = tk.Canvas(root, highlightthickness=0, bd=0,
+                                     bg=self._palette()["bg"])
+            self._canvas.pack(fill=tk.BOTH, expand=True)
+
+            self._apply_geometry()
             root.update_idletasks()
+            _apply_window_effects(root, *self._size())
 
-            hwnd = root.winfo_id()
-            _apply_layered_alpha(hwnd, 0.93)
-            _apply_pill_region(hwnd, W, H)
-            _apply_click_through(hwnd)
-
-            canvas = tk.Canvas(root, width=W, height=H,
-                               bg=BG, highlightthickness=0)
-            canvas.pack()
-            self._canvas = canvas
-
-            # Audio bars
-            cy = H / 2
-            for i in range(BAR_COUNT):
-                bx  = BARS_LEFT + i * (BAR_W + BAR_GAP)
-                bid = canvas.create_rectangle(
-                    bx, cy - BAR_MIN_H / 2,
-                    bx + BAR_W, cy + BAR_MIN_H / 2,
-                    fill=RED, outline='',
-                )
-                self._bar_ids.append(bid)
-
-            # Recording dot
-            self._dot_id = canvas.create_oval(
-                DOT_CX - DOT_R, DOT_CY - DOT_R,
-                DOT_CX + DOT_R, DOT_CY + DOT_R,
-                fill=RED, outline='',
-            )
+            self._bind_events()
+            self._build_items()
 
             root.withdraw()
-            self._ready.set()
-            logger.info("Overlay initialised at %dx%d+%d+%d",
-                        W, H, (sw - W) // 2, sh - H - 80)
+            logger.info("Overlay ready (dock=%s)", self._dock)
+            root.after(FRAME_MS, self._tick)
+        except Exception as e:  # noqa: BLE001 — never take the app down with the overlay
+            logger.exception("Overlay failed to start: %s", e)
+            self._root = None
 
-            root.after(40, self._tick)
-            root.mainloop()
+    def _palette(self):
+        """Overlay colours are fixed dark chrome — it floats over other apps."""
+        return {
+            "bg": "#1B1A16",
+            "idle": "#6E6A5C",
+            "voice": "#7BD1C0",        # hearing you
+            "silent": "#9A9484",       # capturing, but nothing to hear
+            "recording": "#FF5A5F",
+            "transcribing": "#FFB84A",
+            "command": "#D9BCF0",
+            "text": "#FFFFEB",
+        }
 
-        except Exception as exc:
-            logger.exception("Overlay crashed: %s", exc)
-            self._ready.set()
+    def _size(self):
+        return (PILL_H, PILL_W) if self._vertical else (PILL_W, PILL_H)
 
-    # ── Animation (~25 fps) ───────────────────────────────────────────────────
+    def _apply_geometry(self):
+        root = self._root
+        width, height = self._size()
+        screen_w = root.winfo_screenwidth()
+        screen_h = root.winfo_screenheight()
 
+        if self._dock == DOCK_LEFT:
+            x, y = DOCK_MARGIN, (screen_h - height) // 2
+        elif self._dock == DOCK_RIGHT:
+            x, y = screen_w - width - DOCK_MARGIN, (screen_h - height) // 2
+        else:
+            x, y = (screen_w - width) // 2, screen_h - height - 80
+
+        root.geometry(f"{width}x{height}+{x}+{y}")
+        self._canvas.configure(width=width, height=height)
+
+    def _bind_events(self):
+        canvas = self._canvas
+        canvas.bind("<ButtonPress-1>", self._on_press)
+        canvas.bind("<B1-Motion>", self._on_drag)
+        canvas.bind("<ButtonRelease-1>", self._on_release)
+        canvas.bind("<Button-3>", self._on_right_click)
+
+    def _build_items(self):
+        """Lay out the bars along the pill's long axis."""
+        canvas = self._canvas
+        canvas.delete("all")
+        self._bar_ids = []
+
+        width, height = self._size()
+        span = BAR_COUNT * BAR_W + (BAR_COUNT - 1) * BAR_GAP
+        colors = self._palette()
+
+        if self._vertical:
+            start = (height - span) / 2
+            centre = width / 2
+            for index in range(BAR_COUNT):
+                offset = start + index * (BAR_W + BAR_GAP)
+                self._bar_ids.append(canvas.create_rectangle(
+                    centre - BAR_MIN / 2, offset, centre + BAR_MIN / 2,
+                    offset + BAR_W, fill=colors["silent"], outline=""))
+        else:
+            start = (width - span) / 2 - 10
+            centre = height / 2
+            for index in range(BAR_COUNT):
+                offset = start + index * (BAR_W + BAR_GAP)
+                self._bar_ids.append(canvas.create_rectangle(
+                    offset, centre - BAR_MIN / 2, offset + BAR_W,
+                    centre + BAR_MIN / 2, fill=colors["silent"], outline=""))
+
+        # Status dot at the trailing end.
+        if self._vertical:
+            dot_x, dot_y = width / 2, height - 16
+        else:
+            dot_x, dot_y = width - 20, height / 2
+        self._dot_id = canvas.create_oval(dot_x - 5, dot_y - 5, dot_x + 5, dot_y + 5,
+                                          fill=colors["recording"], outline="")
+
+    # ------------------------------------------------------------------
+    # Animation
+    # ------------------------------------------------------------------
     def _tick(self):
         if not self._root:
             return
+        try:
+            self._phase += 0.18
+            colors = self._palette()
 
-        self._phase += 0.16
+            if self._state in (STATE_RECORDING, STATE_COMMAND):
+                rms = audio_mod.get_rms()
+                hearing_voice = audio_mod.has_voice()
+                # A steep power curve: quiet speech should still move the bars,
+                # or the meter reads as broken.
+                scaled = (rms ** 0.25) * 78
+                base = min(BAR_MAX, max(4, scaled))
 
-        if self._state == 'recording':
-            rms  = audio_mod.get_rms()
-            # Aggressive power-curve so even quiet speech drives big movement
-            scaled = (rms ** 0.25) * 90
-            base   = min(BAR_MAX_H, max(5, scaled))
-            for i in range(BAR_COUNT):
-                spread = random.uniform(0.25, 1.0) if rms > 0.004 else random.uniform(0.3, 0.7)
-                self._targets[i] = max(BAR_MIN_H, min(BAR_MAX_H, base * spread))
+                for index in range(BAR_COUNT):
+                    wave = math.sin(self._phase * 1.3 + index * 0.7) * 0.28 + 0.72
+                    self._targets[index] = max(BAR_MIN, min(BAR_MAX, base * wave))
 
-            # Pulse dot size
-            pulse = math.sin(self._phase * 0.9) * 0.5 + 0.5
-            r = DOT_R - 1 + pulse * 2.5
-            self._canvas.coords(self._dot_id,
-                                DOT_CX - r, DOT_CY - r,
-                                DOT_CX + r, DOT_CY + r)
+                accent = colors["command"] if self._state == STATE_COMMAND else colors["voice"]
+                color = accent if hearing_voice else colors["silent"]
+                for bar_id in self._bar_ids:
+                    self._canvas.itemconfig(bar_id, fill=color)
 
-        elif self._state == 'transcribing':
-            for i in range(BAR_COUNT):
-                wave = math.sin(self._phase + i * 0.85) * 0.5 + 0.5
-                self._targets[i] = BAR_MIN_H + wave * (BAR_MAX_H * 0.4 - BAR_MIN_H)
+                pulse = math.sin(self._phase * 0.9) * 0.5 + 0.5
+                self._draw_dot(4 + pulse * 3,
+                               colors["command"] if self._state == STATE_COMMAND
+                               else colors["recording"])
 
-        # Spring-lerp bar heights
-        cy = H / 2
-        for i, bid in enumerate(self._bar_ids):
-            h = self._heights[i] + (self._targets[i] - self._heights[i]) * 0.45
-            self._heights[i] = h
-            bx = BARS_LEFT + i * (BAR_W + BAR_GAP)
-            self._canvas.coords(bid, bx, cy - h / 2, bx + BAR_W, cy + h / 2)
+            elif self._state == STATE_TRANSCRIBING:
+                for index in range(BAR_COUNT):
+                    wave = math.sin(self._phase * 1.6 + index * 0.8) * 0.5 + 0.5
+                    self._targets[index] = BAR_MIN + wave * (BAR_MAX * 0.45)
+                for bar_id in self._bar_ids:
+                    self._canvas.itemconfig(bar_id, fill=colors["transcribing"])
+                self._draw_dot(5, colors["transcribing"])
 
-        self._root.after(40, self._tick)
+            self._apply_bar_heights()
+        except tk.TclError:
+            return      # window torn down mid-frame
+        except Exception as e:  # noqa: BLE001
+            logger.debug("Overlay tick error: %s", e)
 
-    # ── Public API ────────────────────────────────────────────────────────────
+        self._root.after(FRAME_MS, self._tick)
+
+    def _apply_bar_heights(self):
+        width, height = self._size()
+        span = BAR_COUNT * BAR_W + (BAR_COUNT - 1) * BAR_GAP
+
+        for index, bar_id in enumerate(self._bar_ids):
+            current = self._heights[index]
+            # Ease toward the target so the meter reads as motion, not noise.
+            current += (self._targets[index] - current) * 0.45
+            self._heights[index] = current
+
+            if self._vertical:
+                start = (height - span) / 2
+                offset = start + index * (BAR_W + BAR_GAP)
+                centre = width / 2
+                self._canvas.coords(bar_id, centre - current / 2, offset,
+                                    centre + current / 2, offset + BAR_W)
+            else:
+                start = (width - span) / 2 - 10
+                offset = start + index * (BAR_W + BAR_GAP)
+                centre = height / 2
+                self._canvas.coords(bar_id, offset, centre - current / 2,
+                                    offset + BAR_W, centre + current / 2)
+
+    def _draw_dot(self, radius, color):
+        width, height = self._size()
+        if self._vertical:
+            cx, cy = width / 2, height - 16
+        else:
+            cx, cy = width - 20, height / 2
+        self._canvas.coords(self._dot_id, cx - radius, cy - radius,
+                            cx + radius, cy + radius)
+        self._canvas.itemconfig(self._dot_id, fill=color)
+
+    # ------------------------------------------------------------------
+    # Interaction
+    # ------------------------------------------------------------------
+    def _on_press(self, event):
+        self._drag_origin = (event.x_root, event.y_root, time.monotonic())
+
+    def _on_drag(self, event):
+        if not self._drag_origin:
+            return
+        origin_x, origin_y, _ = self._drag_origin
+        if abs(event.x_root - origin_x) < 4 and abs(event.y_root - origin_y) < 4:
+            return
+        width, height = self._size()
+        self._root.geometry(f"{width}x{height}+{event.x_root - width // 2}"
+                            f"+{event.y_root - height // 2}")
+
+    def _on_release(self, event):
+        if not self._drag_origin:
+            return
+        origin_x, origin_y, pressed_at = self._drag_origin
+        self._drag_origin = None
+        moved = abs(event.x_root - origin_x) > 6 or abs(event.y_root - origin_y) > 6
+
+        if not moved:
+            # A click on the bar stops the current dictation.
+            if self._state in (STATE_RECORDING, STATE_COMMAND) and self._on_stop:
+                self._on_stop()
+            return
+
+        self._snap_to_nearest_dock(event.x_root, event.y_root)
+
+    def _snap_to_nearest_dock(self, x, y):
+        screen_w = self._root.winfo_screenwidth()
+        screen_h = self._root.winfo_screenheight()
+
+        distances = {
+            DOCK_LEFT: x,
+            DOCK_RIGHT: screen_w - x,
+            DOCK_BOTTOM: screen_h - y,
+        }
+        dock = min(distances, key=distances.get)
+        self.set_dock(dock)
+
+    def set_dock(self, dock):
+        """Move the pill to an edge, reflowing horizontal/vertical as needed."""
+        if dock not in (DOCK_BOTTOM, DOCK_LEFT, DOCK_RIGHT):
+            return
+        was_vertical = self._vertical
+        self._dock = dock
+        self._vertical = dock in (DOCK_LEFT, DOCK_RIGHT)
+
+        self._apply_geometry()
+        if was_vertical != self._vertical:
+            self._build_items()
+        self._root.update_idletasks()
+        _apply_window_effects(self._root, *self._size())
+
+        self._config.setdefault("ui", {})["overlay_dock"] = dock
+        logger.info("Overlay docked %s", dock)
+
+    def _on_right_click(self, event):
+        """A short context menu — the escape hatches people actually need."""
+        menu = tk.Menu(self._root, tearoff=0)
+        menu.add_command(label="Hide for 1 hour", command=lambda: self.hide_for(3600))
+        menu.add_separator()
+        for dock, label in ((DOCK_BOTTOM, "Dock bottom"), (DOCK_LEFT, "Dock left"),
+                            (DOCK_RIGHT, "Dock right")):
+            menu.add_command(label=label, command=lambda d=dock: self.set_dock(d))
+        if self._on_settings:
+            menu.add_separator()
+            menu.add_command(label="Settings…", command=self._on_settings)
+        if self._state in (STATE_RECORDING, STATE_COMMAND) and self._on_cancel:
+            menu.add_separator()
+            menu.add_command(label="Cancel dictation", command=self._on_cancel)
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    # ------------------------------------------------------------------
+    # Public API — safe from any thread
+    # ------------------------------------------------------------------
+    def _schedule(self, func):
+        if not self._root:
+            return
+        try:
+            self._root.after(0, func)
+        except (tk.TclError, RuntimeError):
+            pass
 
     def show_recording(self):
-        self._schedule(self._do_show_recording)
+        self._schedule(lambda: self._show(STATE_RECORDING))
+
+    def show_command(self):
+        self._schedule(lambda: self._show(STATE_COMMAND))
 
     def show_transcribing(self):
-        self._schedule(self._do_show_transcribing)
+        self._schedule(lambda: self._set_state(STATE_TRANSCRIBING))
 
     def hide(self):
         self._schedule(self._do_hide)
 
-    def _schedule(self, fn):
-        if self._root:
-            try:
-                self._root.after(0, fn)
-            except Exception:
-                pass
+    def hide_for(self, seconds):
+        """Snooze the overlay. Dictation keeps working without it."""
+        self._hidden_until = time.time() + seconds
+        self._config.setdefault("ui", {})["overlay_hidden_until"] = self._hidden_until
+        self.hide()
+        logger.info("Overlay hidden for %d seconds", seconds)
 
-    def _do_show_recording(self):
-        self._state = 'recording'
-        c = self._canvas
-        for bid in self._bar_ids:
-            c.itemconfig(bid, fill=RED)
-        c.itemconfig(self._dot_id, fill=RED)
-        self._root.deiconify()
-        self._root.lift()
-        self._root.wm_attributes('-topmost', True)
+    def is_snoozed(self):
+        return time.time() < self._hidden_until
 
-    def _do_show_transcribing(self):
-        self._state = 'transcribing'
-        c = self._canvas
-        for bid in self._bar_ids:
-            c.itemconfig(bid, fill=ORANGE)
-        c.itemconfig(self._dot_id, fill=ORANGE)
-        # Reset dot to normal size
-        c.coords(self._dot_id,
-                 DOT_CX - DOT_R, DOT_CY - DOT_R,
-                 DOT_CX + DOT_R, DOT_CY + DOT_R)
+    def set_enabled(self, enabled):
+        self._config.setdefault("ui", {})["show_overlay"] = bool(enabled)
+        if not enabled:
+            self.hide()
+
+    def _show(self, state):
+        if not (self._config.get("ui") or {}).get("show_overlay", True):
+            return
+        if self.is_snoozed():
+            return
+        self._set_state(state)
+        try:
+            self._root.deiconify()
+            self._root.lift()
+            self._root.wm_attributes("-topmost", True)
+        except tk.TclError:
+            pass
+
+    def _set_state(self, state):
+        self._state = state
 
     def _do_hide(self):
-        self._state = 'hidden'
-        self._root.withdraw()
+        self._state = STATE_HIDDEN
+        self._heights = [float(BAR_MIN)] * BAR_COUNT
+        self._targets = [float(BAR_MIN)] * BAR_COUNT
+        try:
+            self._root.withdraw()
+        except tk.TclError:
+            pass

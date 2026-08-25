@@ -1,119 +1,129 @@
-"""LocalDictation — main entry point.
+"""LocalDictation — hold a key, talk, and get written text wherever you type.
 
-Architecture: all state lives in DictationApp. Modules are pure functions/classes
-that the app wires together.
+Architecture: a single :class:`DictationApp` owns all state. Tk runs on the main
+thread and owns every window (the overlay, the Hub, the onboarding wizard);
+pystray and the keyboard hooks run on background threads; each dictation runs on
+its own worker so a slow transcription never blocks the hotkey.
+
+The pipeline, in order:
+
+    audio -> whisper (biased by your dictionary) -> dictionary correction
+          -> snippet expansion -> formatter (per-app style) -> injector
+
+Every stage after transcription is optional and degrades to a no-op, so a
+failure anywhere still ends with your words in the text field.
 """
 
-import os
-import sys
-import time
-import threading
 import logging
 import logging.handlers
+import os
+import sys
+import threading
+import time
+
 
 # ---------------------------------------------------------------------------
-# Logging setup — must happen before any other imports that use logging
+# Paths and logging — configured before anything else imports logging
 # ---------------------------------------------------------------------------
-def _setup_logging(app_dir, level_name="INFO"):
-    log_path = os.path.join(app_dir, "dictation.log")
-    level = getattr(logging, level_name.upper(), logging.INFO)
-    root_logger = logging.getLogger()
-    root_logger.setLevel(logging.DEBUG)  # capture everything; handlers filter
-
-    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-                            datefmt="%Y-%m-%d %H:%M:%S")
-
-    # Rotating file handler — 1 MB, 2 backups
-    fh = logging.handlers.RotatingFileHandler(
-        log_path, maxBytes=1_048_576, backupCount=2, encoding="utf-8")
-    fh.setLevel(level)
-    fh.setFormatter(fmt)
-    root_logger.addHandler(fh)
-
-    # Also capture unhandled exceptions
-    def _exc_hook(exc_type, exc_value, exc_tb):
-        if issubclass(exc_type, KeyboardInterrupt):
-            sys.__excepthook__(exc_type, exc_value, exc_tb)
-            return
-        logging.getLogger("main").critical("Unhandled exception", exc_info=(exc_type, exc_value, exc_tb))
-
-    sys.excepthook = _exc_hook
-
-
-# Determine app dir before imports so config paths are correct
 def _get_app_dir():
-    if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
         return os.path.dirname(sys.executable)
     return os.path.dirname(os.path.abspath(__file__))
 
 
 APP_DIR = _get_app_dir()
-_setup_logging(APP_DIR)
+
+
+def _setup_logging(app_dir, level_name="INFO"):
+    log_path = os.path.join(app_dir, "dictation.log")
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.DEBUG)
+
+    formatter = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S")
+
+    handler = logging.handlers.RotatingFileHandler(
+        log_path, maxBytes=1_048_576, backupCount=2, encoding="utf-8")
+    handler.setLevel(getattr(logging, level_name.upper(), logging.INFO))
+    handler.setFormatter(formatter)
+    root_logger.addHandler(handler)
+
+    def _excepthook(exc_type, exc_value, exc_tb):
+        if issubclass(exc_type, KeyboardInterrupt):
+            sys.__excepthook__(exc_type, exc_value, exc_tb)
+            return
+        logging.getLogger("main").critical(
+            "Unhandled exception", exc_info=(exc_type, exc_value, exc_tb))
+
+    sys.excepthook = _excepthook
+    return handler
+
+
+_log_handler = _setup_logging(APP_DIR)
 logger = logging.getLogger("main")
 
 # ---------------------------------------------------------------------------
-# Application imports
-# ---------------------------------------------------------------------------
-import keyboard
-import pyperclip
-import pyautogui
-import winsound
-import winreg
+import tkinter as tk
 
-from config_manager import load_config, save_config, APP_DIR as CFG_APP_DIR
 import audio as audio_mod
-import transcription as transcription_mod
-from tray import TrayIcon, STATE_LOADING, STATE_IDLE, STATE_RECORDING, STATE_TRANSCRIBING
-from settings_ui import open_settings
+import context as context_mod
+import dictionary as dictionary_mod
+import formatter as formatter_mod
 import history as history_mod
+import injector
+import llm
+import snippets as snippets_mod
+import stats as stats_mod
+import transcription as transcription_mod
+import transforms as transforms_mod
+from config_manager import load_config, save_config
 from overlay import RecordingOverlay
+from tray import (STATE_COMMAND, STATE_ERROR, STATE_IDLE, STATE_PAUSED,
+                  STATE_RECORDING, STATE_TRANSCRIBING, TrayIcon)
 
-# ---------------------------------------------------------------------------
-# Voice command map
-# ---------------------------------------------------------------------------
-VOICE_COMMANDS = {
-    "new line":          ("\n", "type"),
-    "new paragraph":     ("\n\n", "type"),
-    "delete that":       ("ctrl+z", "hotkey"),
-    "scratch that":      ("ctrl+z", "hotkey"),
-    "period":            (".", "type"),
-    "full stop":         (".", "type"),
-    "comma":             (",", "type"),
-    "question mark":     ("?", "type"),
-    "exclamation mark":  ("!", "type"),
-    "exclamation point": ("!", "type"),
-    "open bracket":      ("(", "type"),
-    "close bracket":     (")", "type"),
-    "open parenthesis":  ("(", "type"),
-    "close parenthesis": (")", "type"),
-    "open brace":        ("{", "type"),
-    "close brace":       ("}", "type"),
-    "colon":             (":", "type"),
-    "semicolon":         (";", "type"),
-    "hyphen":            ("-", "type"),
-    "dash":              ("-", "type"),
-    "tab key":           ("\t", "type"),
-}
+# Modes a session can be in.
+MODE_DICTATION = "dictation"
+MODE_COMMAND = "command"
 
 
 class DictationApp:
-    """All application state and logic in one place."""
+    """All application state and the dictation pipeline."""
 
     def __init__(self):
         self.config = load_config()
-        self._toggle_lock = threading.Lock()
+        self._apply_log_level()
+
+        self._session_lock = threading.Lock()
         self._model_ready = threading.Event()
-        self._is_recording = False
-        self._recording_start_time = None
-        self._hotkey_handle = None
-        self._ptt_active = False  # push-to-talk state
-        self.tray: TrayIcon = None
+        self._recording = False
+        self._processing = False
+        self._paused = False
+        self._mode = MODE_DICTATION
+        self._session_started = 0.0
+        self._latched = False           # hands-free lock during a PTT session
+        self._press_time = 0.0
+        self._last_tap_time = 0.0
+        self._pending_selection = ""
+        self._cancelled = False
 
-        # Hidden Tk root for after() scheduling (history window needs it)
-        self._tk_root = None
+        self._hooks = []
+        self.tray = None
+        self.overlay = None
+        self.hub = None
+        self.root = None
 
-        history_mod.init(APP_DIR, persist=self.config.get("history_persist", True))
-        self.overlay = RecordingOverlay()
+        history_mod.init(APP_DIR,
+                         persist=self.config.get("history_persist", True),
+                         retention_days=self.config.get("history_retention_days", 0))
+        dictionary_mod.init(APP_DIR)
+        snippets_mod.init(APP_DIR)
+        stats_mod.init(APP_DIR)
+        transforms_mod.init(APP_DIR)
+
+    def _apply_log_level(self):
+        level = self.config.get("log_level", "INFO")
+        _log_handler.setLevel(getattr(logging, str(level).upper(), logging.INFO))
 
     # ------------------------------------------------------------------
     # Startup
@@ -121,304 +131,640 @@ class DictationApp:
     def start(self):
         logger.info("--- LocalDictation starting ---")
 
-        # Start tray icon in background thread FIRST so it's visible immediately
-        self.tray = TrayIcon(
-            on_quit=self.quit,
-            on_settings=self._open_settings_threaded,
-            on_history=self._open_history_threaded,
-        )
-        tray_thread = threading.Thread(target=self.tray.run, daemon=True, name="tray")
-        tray_thread.start()
+        # One Tk root for the whole process, kept hidden. Every window is a
+        # Toplevel of it; a second root makes teardown unpredictable.
+        self.root = tk.Tk()
+        self.root.withdraw()
+        self.root.title("LocalDictation")
 
-        # Apply startup registration if configured
+        self.overlay = RecordingOverlay(
+            self.root, config=self.config,
+            on_stop=self.stop_from_ui, on_cancel=self.cancel,
+            on_settings=lambda: self.open_hub("settings"))
+
+        self.tray = TrayIcon(callbacks={
+            "open_hub": lambda: self.open_hub("home"),
+            "open_settings": lambda: self.open_hub("settings"),
+            "open_history": lambda: self.open_hub("home"),
+            "open_insights": lambda: self.open_hub("insights"),
+            "paste_last": self.paste_last_transcript,
+            "toggle_pause": self.toggle_pause,
+            "set_microphone": self.set_microphone,
+            "quit": self.quit,
+        }, config=self.config)
+        threading.Thread(target=self.tray.run, daemon=True, name="tray").start()
+
         self._apply_startup_setting()
 
-        # Load model in background; hotkey only activates once ready
-        model_thread = threading.Thread(target=self._load_model, daemon=True, name="model-loader")
-        model_thread.start()
+        threading.Thread(target=self._load_model, daemon=True, name="model-loader").start()
 
-        # Block main thread keeping keyboard listener alive
-        keyboard.wait()
+        if self.config.get("llm_warm_up", True):
+            llm.warm_up(self.config)
+
+        if not self.config.get("first_run_complete"):
+            self.root.after(600, self._show_onboarding)
+
+        self.root.mainloop()
 
     def _load_model(self):
-        cfg = self.config
-        model_size = cfg.get("model_size", "base.en")
-        device = cfg.get("device", "auto")
-        log_level = cfg.get("log_level", "INFO")
-
-        # Update logging level from config
-        logging.getLogger().handlers[0].setLevel(getattr(logging, log_level.upper(), logging.INFO))
-
         try:
-            transcription_mod.init_model(model_size=model_size, device=device)
-        except Exception as e:
-            logger.error("Model loading failed: %s", e)
-            self.tray.notify("LocalDictation Error", f"Model failed to load: {e}")
+            info = transcription_mod.init_model(
+                model_size=self.config.get("model_size", "base.en"),
+                device=self.config.get("device", "auto"),
+                compute_type=self.config.get("compute_type"))
+        except Exception as e:  # noqa: BLE001
+            logger.exception("Model loading failed: %s", e)
+            self.tray.set_state(STATE_ERROR)
+            self.tray.notify("LocalDictation", f"Speech model failed to load: {e}")
             return
 
         self._model_ready.set()
-        self._register_hotkey()
+        self._register_hotkeys()
         self.tray.set_state(STATE_IDLE)
 
-        hotkey = self.config.get("trigger_hotkey", "ctrl+shift+f12")
-        self.tray.notify("LocalDictation Ready",
-                         f"Press {hotkey} to start dictating.")
-        logger.info("Model ready. App is listening.")
+        hotkey = (self.config.get("hotkeys") or {}).get("push_to_talk") or "your hotkey"
+        self.tray.notify("LocalDictation is ready",
+                         f"Hold {hotkey} anywhere and start talking.", category="tips")
+        logger.info("Ready — model %s on %s", info.get("model_size"), info.get("device"))
+
+    def model_ready(self):
+        return self._model_ready.is_set()
 
     # ------------------------------------------------------------------
-    # Hotkey registration
+    # Hotkeys
     # ------------------------------------------------------------------
-    def _register_hotkey(self):
-        hotkey = self.config.get("trigger_hotkey", "ctrl+shift+f12")
-        interaction = self.config.get("interaction_mode", "toggle")
-        logger.info("Registering hotkey '%s' (mode=%s)", hotkey, interaction)
+    def _register_hotkeys(self):
+        try:
+            import keyboard
+        except ImportError as e:
+            logger.error("The 'keyboard' package is unavailable: %s", e)
+            self.tray.notify("LocalDictation",
+                             "Global hotkeys are unavailable on this system.")
+            return
 
-        # Remove previous binding if any
-        self._unregister_hotkey()
+        self._unregister_hotkeys()
+        hotkeys = self.config.get("hotkeys") or {}
 
-        if interaction == "push_to_talk":
-            keyboard.on_press_key(hotkey.split("+")[-1], self._ptt_press, suppress=True)
-            keyboard.on_release_key(hotkey.split("+")[-1], self._ptt_release, suppress=True)
-            self._hotkey_handle = hotkey  # store the key name for cleanup
-        else:
-            self._hotkey_handle = keyboard.add_hotkey(hotkey, self._on_toggle, suppress=True)
-
-    def _unregister_hotkey(self):
-        if self._hotkey_handle is not None:
+        def bind(binding, handler, trigger="down"):
+            if not binding:
+                return
             try:
-                if isinstance(self._hotkey_handle, str):
-                    # PTT mode stored the key string
-                    keyboard.unhook_all_hotkeys()
-                else:
-                    keyboard.remove_hotkey(self._hotkey_handle)
-            except Exception as e:
-                logger.warning("Error removing hotkey: %s", e)
-            self._hotkey_handle = None
+                self._hooks.append(
+                    keyboard.add_hotkey(binding, handler, suppress=False,
+                                        trigger_on_release=(trigger == "up")))
+            except Exception as e:  # noqa: BLE001 — an invalid binding must not abort the rest
+                logger.warning("Could not bind %r: %s", binding, e)
 
-    # ------------------------------------------------------------------
-    # Toggle (default mode)
-    # ------------------------------------------------------------------
-    def _on_toggle(self):
-        if not self._model_ready.is_set():
-            self.tray.notify("LocalDictation", "Model is still loading, please wait.")
+        # Push-to-talk needs press *and* release, so it is hooked directly
+        # rather than through add_hotkey, which only fires once per combination.
+        ptt = hotkeys.get("push_to_talk")
+        if ptt:
+            try:
+                self._hooks.append(
+                    keyboard.add_hotkey(ptt, self._on_ptt_press, suppress=False))
+                # The release edge is detected by watching the last key of the
+                # combination; add_hotkey has no release callback.
+                last_key = ptt.split("+")[-1].strip()
+                keyboard.on_release_key(last_key, self._on_ptt_release)
+                self._hooks.append(("release", last_key))
+            except Exception as e:  # noqa: BLE001
+                logger.warning("Could not bind push-to-talk %r: %s", ptt, e)
+
+        bind(hotkeys.get("hands_free"), self._on_hands_free)
+        bind(hotkeys.get("command_mode"), self._on_command_mode)
+        bind(hotkeys.get("paste_last"), self.paste_last_transcript)
+        bind(hotkeys.get("scratchpad"), lambda: self.open_hub("home"))
+        bind(hotkeys.get("cancel", "esc"), self._on_cancel_key)
+
+        for binding, name in transforms_mod.hotkey_bindings():
+            bind(binding, lambda n=name: self.run_transform(n))
+
+        logger.info("Hotkeys registered: %s", {k: v for k, v in hotkeys.items() if v})
+
+    def _unregister_hotkeys(self):
+        if not self._hooks:
             return
-        # Dispatch to a worker thread immediately so the keyboard hook
-        # callback returns fast — Windows kills low-level hooks that block.
-        threading.Thread(target=self._toggle_worker, daemon=True, name="toggle").start()
-
-    def _toggle_worker(self):
-        if not self._toggle_lock.acquire(blocking=False):
-            return  # Already processing
         try:
-            if not self._is_recording:
-                self._start_recording()
-            else:
-                self._stop_and_transcribe()
-        finally:
-            self._toggle_lock.release()
+            import keyboard
+            keyboard.unhook_all_hotkeys()
+        except Exception as e:  # noqa: BLE001
+            logger.debug("Could not unhook hotkeys: %s", e)
+        self._hooks = []
 
     # ------------------------------------------------------------------
-    # Push-to-talk
+    # Hotkey handlers
     # ------------------------------------------------------------------
-    def _ptt_press(self, event):
+    def _on_ptt_press(self):
+        if not self._ready_to_record():
+            return
+
+        now = time.monotonic()
+        double_tap_window = self.config.get("double_tap_seconds", 0.4)
+
+        # A second tap inside the window latches the session on, so one key does
+        # both hold-to-talk and hands-free.
+        if now - self._last_tap_time < double_tap_window:
+            self._last_tap_time = 0.0
+            if self._recording:
+                self._latched = True
+                logger.info("Session latched to hands-free")
+                return
+        self._last_tap_time = now
+
+        if self._recording:
+            return
+        self._press_time = now
+        self._start_session(MODE_DICTATION)
+
+    def _on_ptt_release(self, _event=None):
+        if not self._recording or self._latched:
+            return
+
+        held = time.monotonic() - self._press_time
+        minimum = self.config.get("min_hold_seconds", 0.35)
+        if held < minimum:
+            # A jab at the key is an accident, not a dictation.
+            logger.info("Hold too short (%.2fs) — cancelling", held)
+            self._abort_session(silent=True)
+            return
+
+        self._finish_session()
+
+    def _on_hands_free(self):
+        if self._recording:
+            self._latched = False
+            self._finish_session()
+            return
+        if not self._ready_to_record():
+            return
+        self._latched = True
+        self._start_session(MODE_DICTATION)
+
+    def _on_command_mode(self):
+        if self._recording:
+            self._latched = False
+            self._finish_session()
+            return
+        if not self._ready_to_record():
+            return
+        self._latched = True
+        self._start_session(MODE_COMMAND)
+
+    def _on_cancel_key(self):
+        if self._recording:
+            self.cancel()
+
+    def _ready_to_record(self):
+        if self._paused:
+            return False
         if not self._model_ready.is_set():
-            return
-        if not self._ptt_active and not self._is_recording:
-            self._ptt_active = True
-            self._start_recording()
-
-    def _ptt_release(self, event):
-        if self._ptt_active and self._is_recording:
-            self._ptt_active = False
-            self._stop_and_transcribe()
+            self.tray.notify("LocalDictation", "The speech model is still loading.",
+                             category="tips")
+            return False
+        if self._processing:
+            # Only one dictation is in flight at a time; starting a second would
+            # race for the same cursor.
+            self.tray.notify("LocalDictation",
+                             "Still finishing your last dictation.", category="tips")
+            return False
+        return True
 
     # ------------------------------------------------------------------
-    # Recording
+    # Session lifecycle
     # ------------------------------------------------------------------
-    def _start_recording(self):
-        logger.info("Recording started")
-        self._is_recording = True
-        self._recording_start_time = time.monotonic()
-        self.tray.set_state(STATE_RECORDING)
-        self.overlay.show_recording()
-        winsound.Beep(800, 100)  # start beep
+    def _start_session(self, mode):
+        with self._session_lock:
+            if self._recording:
+                return
+            self._recording = True
+            self._cancelled = False
+            self._mode = mode
+            self._session_started = time.monotonic()
 
-        silence_secs = self.config.get("silence_threshold_seconds", 3.0)
-        device_index = self.config.get("audio_device_index", None)
+        # Command mode operates on the selection, so grab it before the user's
+        # focus can move.
+        self._pending_selection = ""
+        if mode == MODE_COMMAND:
+            try:
+                self._pending_selection = injector.read_selection()
+            except Exception as e:  # noqa: BLE001
+                logger.warning("Could not read selection: %s", e)
 
-        on_silence = None
-        if silence_secs and silence_secs > 0:
-            on_silence = self._on_silence_triggered
+        self.tray.set_state(STATE_COMMAND if mode == MODE_COMMAND else STATE_RECORDING)
+        if mode == MODE_COMMAND:
+            self.overlay.show_command()
+        else:
+            self.overlay.show_recording()
+        self._play_sound(start=True)
 
-        audio_mod.start_recording(
-            sample_rate=16000,
-            channels=1,
-            device_index=device_index,
-            silence_threshold_seconds=silence_secs,
-            on_silence_callback=on_silence,
-        )
+        audio_config = dict(self.config.get("audio") or {})
+        started = audio_mod.start_recording(
+            sample_rate=audio_config.get("sample_rate", 16000),
+            device_index=audio_config.get("device_index"),
+            config=audio_config,
+            callbacks={
+                "silence": self._on_auto_stop,
+                "no_audio": self._on_no_audio,
+                "mic_dead": self._on_mic_dead,
+                "limit_warning": self._on_limit_warning,
+                "limit_reached": self._on_limit_reached,
+                "error": self._on_audio_error,
+            })
 
-    def _on_silence_triggered(self):
-        """Called from silence-monitor background thread."""
-        if not self._toggle_lock.acquire(blocking=False):
-            return  # toggle_worker already handling stop
-        try:
-            if self._is_recording:
-                logger.info("Auto-stop: silence detected")
-                self._stop_and_transcribe()
-        finally:
-            self._toggle_lock.release()
+        if not started:
+            self._recording = False
+            self.overlay.hide()
+            self.tray.set_state(STATE_ERROR)
+            self.tray.notify("Microphone unavailable",
+                             "LocalDictation could not open your microphone.")
 
-    def _stop_and_transcribe(self):
-        if not self._is_recording:
+    def stop_from_ui(self):
+        """Clicking the overlay ends the session."""
+        if self._recording:
+            self._latched = False
+            self._finish_session()
+
+    def cancel(self):
+        """Discard the recording without transcribing or inserting anything."""
+        if not self._recording:
             return
+        logger.info("Session cancelled by user")
+        self._abort_session(silent=False)
 
-        self._is_recording = False
-        duration = time.monotonic() - (self._recording_start_time or time.monotonic())
-        winsound.Beep(600, 100)  # stop beep
+    def _abort_session(self, silent=False):
+        with self._session_lock:
+            if not self._recording:
+                return
+            self._recording = False
+            self._cancelled = True
+            self._latched = False
+
+        audio_mod.discard_recording()
+        self.overlay.hide()
+        self.tray.set_state(STATE_IDLE)
+        if not silent:
+            self.tray.notify("Dictation cancelled", "Nothing was inserted.",
+                             category="tips")
+
+    def _finish_session(self):
+        with self._session_lock:
+            if not self._recording:
+                return
+            self._recording = False
+            self._latched = False
+            self._processing = True
+
+        duration = time.monotonic() - self._session_started
+        self._play_sound(start=False)
         self.tray.set_state(STATE_TRANSCRIBING)
         self.overlay.show_transcribing()
-        logger.info("Recording stopped (%.1fs). Transcribing...", duration)
 
-        wav_path = audio_mod.stop_recording_and_save(output_file=None, sample_rate=16000)
-        if not wav_path:
-            logger.warning("No audio captured")
-            self.tray.set_state(STATE_IDLE)
+        threading.Thread(target=self._process_session, args=(duration,),
+                         daemon=True, name="dictation").start()
+
+    # ------------------------------------------------------------------
+    # Processing
+    # ------------------------------------------------------------------
+    def _process_session(self, duration):
+        mode = self._mode
+        try:
+            wav_path = audio_mod.stop_recording_and_save(
+                sample_rate=(self.config.get("audio") or {}).get("sample_rate", 16000))
+            if not wav_path:
+                logger.info("Nothing captured")
+                return
+
+            raw = self._transcribe(wav_path)
+            if not raw:
+                logger.info("No speech detected")
+                return
+
+            if mode == MODE_COMMAND:
+                self._handle_command(raw, duration)
+            else:
+                self._handle_dictation(raw, duration)
+
+        except Exception as e:  # noqa: BLE001 — the loop must survive any single failure
+            logger.exception("Dictation failed: %s", e)
+            self.tray.notify("Dictation failed", str(e)[:120])
+        finally:
+            self._processing = False
             self.overlay.hide()
+            self.tray.set_state(STATE_PAUSED if self._paused else STATE_IDLE)
+            self._refresh_hub()
+
+    def _transcribe(self, wav_path):
+        dictionary_config = self.config.get("dictionary") or {}
+        prompt = hotwords = None
+        if dictionary_config.get("enabled", True) and dictionary_config.get("bias_decoding", True):
+            prompt = dictionary_mod.initial_prompt()
+            terms = dictionary_mod.bias_terms()
+            hotwords = " ".join(terms) if terms else None
+
+        text, _info = transcription_mod.transcribe_audio(
+            wav_path,
+            language=self.config.get("language"),
+            language_pool=self.config.get("language_pool"),
+            initial_prompt=prompt,
+            hotwords=hotwords)
+        return (text or "").strip()
+
+    def _handle_dictation(self, raw, duration):
+        app_context = context_mod.resolve(self.config)
+        profile = context_mod.profile_for(app_context, self.config)
+        options = formatter_mod.FormatOptions.from_config(self.config, profile)
+        options.app_name = app_context.app_name
+
+        text = raw
+        replacements = 0
+
+        # Vocabulary correction first: later stages should reason about the
+        # words the user actually said, correctly spelled.
+        if (self.config.get("dictionary") or {}).get("enabled", True):
+            corrected = dictionary_mod.correct(text)
+            if corrected != text:
+                replacements += 1
+            text = corrected
+
+        if self.config.get("snippets_enabled", True):
+            text, fired = snippets_mod.expand(text, injector.read_clipboard())
+            replacements += len(fired)
+
+        result = formatter_mod.format_text(
+            text, config=self.config, options=options,
+            vocabulary=dictionary_mod.bias_terms())
+        final = result.text
+
+        trailing_action = None
+        if (self.config.get("output") or {}).get("trailing_actions", True):
+            final, trailing_action = injector.extract_trailing_action(final)
+
+        if not final.strip():
+            logger.info("Nothing left after formatting")
             return
 
-        language = self.config.get("language", None)
-        text = transcription_mod.transcribe_audio(wav_path, language=language)
+        if options.trailing_space and not trailing_action:
+            final += " "
 
-        if text and text.strip():
-            processed = self._process_text(text.strip())
-            if processed is not None:
-                self._output_text(processed)
-                history_mod.add_entry(text.strip(), duration)
-        else:
-            logger.info("No speech detected")
+        output = self.config.get("output") or {}
+        ok, message = injector.insert(
+            final,
+            mode=output.get("paste_mode", "clipboard"),
+            restore_delay=output.get("clipboard_restore_delay", 0.25),
+            restore_clipboard=output.get("restore_clipboard", True),
+            trailing_action=trailing_action)
 
-        self.tray.set_state(STATE_IDLE)
-        self.overlay.hide()
+        if not ok:
+            hotkey = (self.config.get("hotkeys") or {}).get("paste_last", "")
+            suffix = f" Press {hotkey} to paste it." if hotkey else ""
+            self.tray.notify("Could not insert text", message + suffix)
 
-    # ------------------------------------------------------------------
-    # Text processing pipeline
-    # ------------------------------------------------------------------
-    def _process_text(self, text):
-        """Apply substitutions, then check for voice commands.
+        words = len(final.split())
+        cleaned = max(0, len(raw.split()) - words)
+        history_mod.add_entry(
+            raw=raw, text=final.strip(), duration=duration,
+            app=app_context.exe, app_title=app_context.title,
+            category=app_context.category,
+            cleanup_level=(self.config.get("formatting") or {}).get("cleanup_level", ""),
+            used_llm=result.used_llm, cleaned_words=cleaned, replacements=replacements)
+        stats_mod.record_session(words=words, audio_seconds=duration,
+                                 cleaned_words=cleaned, replacements=replacements,
+                                 app=app_context.exe)
+        logger.info("Inserted %d words into %s", words, app_context.exe or "unknown")
 
-        Returns final text to output, or None if a command was handled inline.
-        """
-        # 1. Word substitutions
-        subs = self.config.get("word_substitutions", {})
-        for find, replace in subs.items():
-            text = text.replace(find, replace)
+    def _handle_command(self, instruction, duration):
+        selection = self._pending_selection
+        self._pending_selection = ""
 
-        # 2. Voice commands (whole-text match, case-insensitive)
-        lower = text.lower().strip().rstrip(".,!?")
-        if lower in VOICE_COMMANDS:
-            action, action_type = VOICE_COMMANDS[lower]
-            logger.info("Voice command: '%s' -> %s '%s'", lower, action_type, action)
-            if action_type == "hotkey":
-                pyautogui.hotkey(*action.split("+"))
-            else:
-                self._paste_or_type(action)
-            return None  # signal: already handled
+        if not selection.strip():
+            # Nothing selected: fall back to inserting what was said. Silently
+            # sending the utterance to a web search — as some tools do — would
+            # be a surprising thing for an offline app to do.
+            logger.info("Command mode with no selection — inserting as dictation")
+            self._handle_dictation(instruction, duration)
+            return
 
-        return text
+        result, message = transforms_mod.run(selection, instruction, self.config)
+        if result is None:
+            self.tray.notify("Command mode", message or "Nothing was changed.")
+            return
 
-    def _output_text(self, text):
-        """Paste or type the text into the active window."""
-        paste_mode = self.config.get("paste_mode", "clipboard")
-        if paste_mode == "type":
-            pyautogui.write(text + " ", interval=0.01)
-        else:
-            self._paste_or_type(text + " ")
+        output = self.config.get("output") or {}
+        ok, insert_message = injector.insert(
+            result, mode=output.get("paste_mode", "clipboard"),
+            restore_delay=output.get("clipboard_restore_delay", 0.25),
+            restore_clipboard=output.get("restore_clipboard", True))
+        if not ok:
+            self.tray.notify("Could not replace selection", insert_message)
+            return
 
-    def _paste_or_type(self, text):
-        try:
-            pyperclip.copy(text)
-            pyautogui.hotkey("ctrl", "v")
-        except Exception as e:
-            logger.warning("Clipboard paste failed, falling back to type: %s", e)
-            pyautogui.write(text, interval=0.01)
+        history_mod.add_entry(raw=instruction, text=result, duration=duration,
+                              mode=history_mod.MODE_COMMAND)
+        logger.info("Command applied: %r", instruction[:60])
 
-    # ------------------------------------------------------------------
-    # Settings
-    # ------------------------------------------------------------------
-    def _open_settings_threaded(self):
+    def run_transform(self, name):
+        """Apply a saved transform to the current selection, no speaking needed."""
+        if self._processing:
+            return
+
         def _run():
-            open_settings(self._on_settings_saved)
-        threading.Thread(target=_run, daemon=True, name="settings-ui").start()
+            selection = injector.read_selection()
+            if not selection.strip():
+                self.tray.notify("Transform", "Select some text first.")
+                return
+            result, message = transforms_mod.run_named(selection, name, self.config)
+            if result is None:
+                self.tray.notify("Transform", message or "Nothing was changed.")
+                return
+            output = self.config.get("output") or {}
+            injector.insert(result, mode=output.get("paste_mode", "clipboard"),
+                            restore_clipboard=output.get("restore_clipboard", True))
+            history_mod.add_entry(raw=selection, text=result,
+                                  mode=history_mod.MODE_COMMAND)
 
-    def _on_settings_saved(self, new_config):
-        logger.info("Settings saved — applying changes")
+        threading.Thread(target=_run, daemon=True, name="transform").start()
+
+    # ------------------------------------------------------------------
+    # Audio watchdog callbacks
+    # ------------------------------------------------------------------
+    def _on_auto_stop(self):
+        if self._recording:
+            logger.info("Auto-stopping after silence")
+            self._finish_session()
+
+    def _on_no_audio(self, seconds):
+        self.tray.notify("No audio received",
+                         f"Nothing heard for {int(seconds)}s. Check your microphone.",
+                         category="errors")
+
+    def _on_mic_dead(self, _seconds):
+        self.tray.notify("Microphone is not working",
+                         "Still silent. Pick a different input in Settings.",
+                         category="errors")
+
+    def _on_limit_warning(self, remaining):
+        self.tray.notify("Session ending soon",
+                         f"Less than {max(1, remaining // 60)} minute(s) left.",
+                         category="session_limits")
+
+    def _on_limit_reached(self):
+        # End gracefully and insert what was said rather than discarding it.
+        if self._recording:
+            self.tray.notify("Session limit reached",
+                             "Transcribing what you said so far.",
+                             category="session_limits")
+            self._latched = False
+            self._finish_session()
+
+    def _on_audio_error(self, message):
+        self.tray.notify("Microphone error", message[:120], category="errors")
+
+    # ------------------------------------------------------------------
+    # Sounds
+    # ------------------------------------------------------------------
+    def _play_sound(self, start=True):
+        """Two distinct tones: one confirms the mic is live, one confirms insertion."""
+        if not (self.config.get("ui") or {}).get("sounds", True):
+            return
+        if sys.platform != "win32":
+            return
+
+        def _beep():
+            try:
+                import winsound
+                winsound.Beep(880 if start else 620, 90)
+            except Exception as e:  # noqa: BLE001
+                logger.debug("Sound failed: %s", e)
+
+        threading.Thread(target=_beep, daemon=True, name="sound").start()
+
+    # ------------------------------------------------------------------
+    # Tray and window actions
+    # ------------------------------------------------------------------
+    def toggle_pause(self):
+        self._paused = not self._paused
+        if self._paused and self._recording:
+            self._abort_session(silent=True)
+        self.tray.set_paused(self._paused)
+        logger.info("Dictation %s", "paused" if self._paused else "resumed")
+
+    def set_microphone(self, index):
+        self.config.setdefault("audio", {})["device_index"] = index
+        save_config(self.config)
+        self.tray.refresh_menu()
+        logger.info("Microphone set to %s", audio_mod.get_device_name(index))
+
+    def paste_last_transcript(self):
+        output = self.config.get("output") or {}
+        ok, message = injector.paste_last_transcript(
+            mode=output.get("paste_mode", "clipboard"),
+            restore_clipboard=output.get("restore_clipboard", True))
+        if not ok:
+            self.tray.notify("Paste last transcript", message)
+
+    def open_hub(self, page="home"):
+        """Open the main window. Must run on the Tk thread."""
+        def _open():
+            try:
+                if self.hub is None or not self.hub.winfo_exists():
+                    from ui.hub import Hub
+                    self.hub = Hub(self.root, self.config,
+                                   on_config_changed=self.apply_config, app=self)
+                self.hub.show(page)
+            except Exception as e:  # noqa: BLE001
+                logger.exception("Could not open the Hub: %s", e)
+                self.tray.notify("LocalDictation", "Could not open the main window.")
+
+        self.root.after(0, _open)
+
+    def _refresh_hub(self):
+        if self.hub is None:
+            return
+
+        def _refresh():
+            try:
+                if self.hub.winfo_exists() and self.hub.state() != "withdrawn":
+                    self.hub.refresh_current()
+            except Exception as e:  # noqa: BLE001
+                logger.debug("Hub refresh failed: %s", e)
+
+        self.root.after(0, _refresh)
+
+    def _show_onboarding(self):
+        try:
+            from ui import onboarding
+            onboarding.maybe_run(self.root, self.config,
+                                 on_finish=self.apply_config, app=self)
+        except Exception as e:  # noqa: BLE001
+            logger.exception("Onboarding failed: %s", e)
+
+    # ------------------------------------------------------------------
+    # Config changes
+    # ------------------------------------------------------------------
+    def apply_config(self, new_config):
+        """Re-apply everything that can change without a restart."""
         self.config = new_config
-
-        # Apply startup registration
+        save_config(self.config)
+        self._apply_log_level()
         self._apply_startup_setting()
 
-        # Re-register hotkey (mode or key may have changed)
         if self._model_ready.is_set():
-            self._register_hotkey()
+            self._register_hotkeys()
 
-        # Note: model size/device changes require restart to take effect
-        # We notify the user
-        self.tray.notify("LocalDictation", "Settings saved. Model changes take effect on next restart.")
+        self.overlay.set_enabled((self.config.get("ui") or {}).get("show_overlay", True))
+        if self.tray:
+            self.tray.refresh_menu()
+        logger.info("Configuration applied")
 
-    def _open_history_threaded(self):
-        def _run():
-            # Tkinter windows need a root — create a hidden one if needed
-            import tkinter as tk
-            root = tk.Tk()
-            root.withdraw()
-            history_mod.open_history_window(root)
-            root.mainloop()
-        threading.Thread(target=_run, daemon=True, name="history-ui").start()
-
-    # ------------------------------------------------------------------
-    # Windows startup registry
-    # ------------------------------------------------------------------
     def _apply_startup_setting(self):
+        """Register or remove the Run key so the app can start with Windows."""
+        if sys.platform != "win32":
+            return
+        try:
+            import winreg
+        except ImportError:
+            return
+
         enabled = self.config.get("launch_at_startup", False)
         app_name = "LocalDictation"
         reg_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
 
-        if getattr(sys, 'frozen', False):
-            exe_path = f'"{sys.executable}"'
+        if getattr(sys, "frozen", False):
+            command = f'"{sys.executable}"'
         else:
-            exe_path = f'"{sys.executable}" "{os.path.abspath(__file__)}"'
+            command = f'"{sys.executable}" "{os.path.abspath(__file__)}"'
 
         try:
-            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, reg_path, 0, winreg.KEY_SET_VALUE)
-            if enabled:
-                winreg.SetValueEx(key, app_name, 0, winreg.REG_SZ, exe_path)
-                logger.info("Startup registry key set")
-            else:
-                try:
-                    winreg.DeleteValue(key, app_name)
-                    logger.info("Startup registry key removed")
-                except FileNotFoundError:
-                    pass  # already absent
-            winreg.CloseKey(key)
-        except Exception as e:
-            logger.warning("Could not update startup registry: %s", e)
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, reg_path, 0,
+                                winreg.KEY_SET_VALUE) as key:
+                if enabled:
+                    winreg.SetValueEx(key, app_name, 0, winreg.REG_SZ, command)
+                else:
+                    try:
+                        winreg.DeleteValue(key, app_name)
+                    except FileNotFoundError:
+                        pass
+        except OSError as e:
+            logger.warning("Could not update the startup entry: %s", e)
 
     # ------------------------------------------------------------------
-    # Quit
-    # ------------------------------------------------------------------
     def quit(self):
-        logger.info("Application quitting")
-        self._unregister_hotkey()
+        logger.info("Shutting down")
+        self._unregister_hotkeys()
+        if self._recording:
+            audio_mod.discard_recording()
+        save_config(self.config)
+        if self.tray:
+            self.tray.stop()
+        try:
+            self.root.after(0, self.root.quit)
+        except Exception:  # noqa: BLE001
+            pass
         os._exit(0)
 
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
 def main():
-    app = DictationApp()
-    app.start()
+    DictationApp().start()
 
 
 if __name__ == "__main__":
