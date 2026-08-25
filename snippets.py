@@ -227,14 +227,16 @@ def expand(text, clipboard_text=""):
         text = regex.sub(_park, text)
         fired.append(snippet["trigger"])
 
-    for index, value in enumerate(expansions):
-        text = text.replace(f"\x00s{index}\x00", value)
-
     if fired:
         # Splicing an expansion mid-sentence tends to leave doubled spaces or a
-        # space stranded before punctuation.
+        # space stranded before punctuation. This runs while the expansions are
+        # still parked behind placeholders, so a snippet's own indentation and
+        # blank lines are not collapsed along with the seam.
         text = re.sub(r"[ \t]{2,}", " ", text)
         text = re.sub(r"\s+([,.;:!?])", r"\1", text)
         logger.info("Snippets fired: %s", ", ".join(fired))
+
+    for index, value in enumerate(expansions):
+        text = text.replace(f"\x00s{index}\x00", value)
 
     return text, fired

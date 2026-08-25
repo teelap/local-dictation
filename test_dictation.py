@@ -165,6 +165,66 @@ class CapitalizationTests(unittest.TestCase):
         self.assertTrue(result.text.startswith("I think I'll"))
 
 
+class AmbiguityTests(unittest.TestCase):
+    """Words that look like something the formatter rewrites, but are not.
+
+    Every case here is a false positive that reached real output during the
+    build. They matter more than the features they guard: silently changing a
+    word the speaker did say is worse than failing to tidy one.
+    """
+
+    def _run(self, text):
+        return format_text(text, options=FormatOptions()).text
+
+    def test_modal_may_is_not_the_month(self):
+        self.assertIn("we may ship", self._run("we may ship it next week").lower())
+        self.assertNotIn("May ship", self._run("we may ship it next week"))
+
+    def test_verb_march_is_not_the_month(self):
+        self.assertNotIn("March", self._run("they will march to the office"))
+
+    def test_month_next_to_a_day_number_is_capitalized(self):
+        self.assertIn("March 14", self._run("the deadline is march 14"))
+
+    def test_article_before_dot_com_is_not_a_domain(self):
+        result = self._run("she works at a dot com company")
+        self.assertNotIn("@", result)
+        self.assertNotIn("a.com", result)
+
+    def test_initialisms_survive_punctuation_spacing(self):
+        self.assertIn("U.S.", self._run("the U.S. economy"))
+        self.assertIn("F.B.I.", self._run("call the F.B.I. today"))
+
+    def test_thirty_second_is_a_duration_not_an_ordinal(self):
+        self.assertIn("30 second", self._run("a thirty second video"))
+        self.assertNotIn("32nd", self._run("a thirty second video"))
+
+    def test_ordinal_after_the_is_still_a_date(self):
+        self.assertIn("21st", self._run("on the twenty first"))
+
+    def test_suspended_compound_is_not_a_stutter(self):
+        self.assertIn("Pre- and post-launch", self._run("pre- and post-launch reviews"))
+
+    def test_real_cut_off_stutter_is_removed(self):
+        self.assertEqual(self._run("I- I think we should go"), "I think we should go.")
+
+    def test_substitution_replacement_is_literal(self):
+        """Regression: a backslash or \\1 in a rule raised and killed the dictation."""
+        self.assertEqual(
+            formatter.apply_substitutions("teh", {"teh": r"the \1 & \\"}),
+            r"the \1 & \\")
+
+    def test_llm_guard_keeps_a_genuinely_quoted_sentence(self):
+        self.assertEqual(formatter._sanitize_llm_output('"yes."', '"Yes."'), '"Yes."')
+
+    def test_llm_guard_still_strips_added_quotes(self):
+        self.assertEqual(formatter._sanitize_llm_output("yes", '"Yes."'), "Yes.")
+
+    def test_trailing_action_keeps_the_previous_period(self):
+        self.assertEqual(injector.extract_trailing_action("Done. press enter"),
+                         ("Done.", "enter"))
+
+
 class CleanupLevelTests(unittest.TestCase):
     RAW = "um so i think we should uh ship it on friday at three thirty p m"
 
@@ -337,6 +397,12 @@ class SnippetTests(unittest.TestCase):
         snippets.add("regex snippet", r"cost is $5 (50\% off) [sale]")
         text, _ = snippets.expand("the regex snippet applies")
         self.assertIn(r"cost is $5 (50\% off) [sale]", text)
+
+    def test_expansion_keeps_its_own_indentation(self):
+        """Regression: the seam tidy collapsed indentation inside the snippet."""
+        snippets.add("standup", "Yesterday:\n  - shipped\nToday:")
+        text, _ = snippets.expand("here is the standup")
+        self.assertIn("\n  - shipped\n", text)
 
 
 class PerformanceTests(unittest.TestCase):

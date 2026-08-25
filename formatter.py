@@ -133,12 +133,22 @@ _PHRASE_OPENERS = {
     "this", "that", "these", "those",
 }
 
-# Proper nouns Whisper reliably lowercases.
+# Weekday names are never ordinary words, so they can be capitalized anywhere.
 _ALWAYS_CAPITALIZED = [
     "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+]
+
+# Month names are not safe unconditionally — "may", "march" and "august" are all
+# ordinary English words ("we may ship", "they march on"). These are capitalized
+# only next to a day number, which is what makes them a date.
+_MONTHS = [
     "january", "february", "march", "april", "may", "june", "july", "august",
     "september", "october", "november", "december",
 ]
+
+# Initialisms must survive punctuation normalisation intact, or "the U.S.
+# economy" comes back as "the U. S. economy".
+_INITIALISM_RE = r"\b(?:[A-Za-z]\.){2,}"
 
 _NUMBER_WORDS = {
     "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
@@ -292,7 +302,9 @@ def remove_stutters(text):
         return text
 
     # Cut-off fragments Whisper sometimes emits: "I- I think", "th- the cat".
-    text = re.sub(r"\b\w{1,3}-\s+", "", text)
+    # The lookahead requires the next word to restart the same sound, so a
+    # suspended compound ("pre- and post-launch") is left alone.
+    text = re.sub(r"\b(\w{1,3})-\s+(?=\1)", "", text, flags=re.IGNORECASE)
 
     def _collapse(match):
         word = match.group(1)
@@ -367,12 +379,17 @@ def apply_spoken_symbols(text):
 
     tld_alt = "|".join(_TLDS)
 
-    # Email: "john at gmail dot com" -> "john@gmail.com"
+    # Email: "john at gmail dot com" -> "john@gmail.com". The host label carries
+    # the same guard as the bare-domain rule below — without it, "she works at a
+    # dot com company" is read as an address and becomes "works@a.com".
     text = re.sub(
-        rf"\b([\w.\-]+)\s+at\s+([\w\-]+)\s+dot\s+({tld_alt})\b",
+        rf"\b([\w.\-]+)\s+at\s+(?!(?:a|an|the)\b)([\w\-]{{2,}})\s+dot\s+({tld_alt})\b",
         r"\1@\2.\3", text, flags=re.IGNORECASE)
-    # Domain without a local part: "example dot com" -> "example.com"
-    text = re.sub(rf"\b([\w\-]+)\s+dot\s+({tld_alt})\b", r"\1.\2", text, flags=re.IGNORECASE)
+    # Domain without a local part: "example dot com" -> "example.com". The label
+    # must be at least two characters and not an article, or "a dot com company"
+    # turns into "a.com company".
+    text = re.sub(rf"\b(?!(?:a|an|the)\b)([\w\-]{{2,}})\s+dot\s+({tld_alt})\b",
+                  r"\1.\2", text, flags=re.IGNORECASE)
     # "dot slash", "www dot"
     text = re.sub(r"\bw{3}\s+dot\s+", "www.", text, flags=re.IGNORECASE)
     text = re.sub(r"\bdouble\s+u\s+double\s+u\s+double\s+u\s+dot\s+", "www.", text, flags=re.IGNORECASE)
@@ -576,10 +593,20 @@ def apply_smart_numbers(text):
         # "second" and "third" are ordinary words far more often than ordinals.
         if value < 10 and not tens:
             return match.group(0)
+        # A tens word joined to "second" is usually a duration, not a date:
+        # "a thirty second video" must not become "a 32nd video". Requiring the
+        # date-shaped lead-in ("the", "on the", a month) keeps real dates.
+        if tens and match.group("ord").lower() in ("second", "third")            \
+                and not match.group("lead"):
+            return f"{_NUMBER_WORDS[tens.lower()]} {match.group('ord')}"
         return f"{value}{_ordinal_suffix(value)}"
 
-    text = re.sub(rf"\b(?:(?P<tens>{tens_re})[\s-]+)?(?P<ord>{ordinal_re})\b",
-                  _replace_ordinal, text, flags=re.IGNORECASE)
+    month_re = "|".join(_MONTHS)
+    text = re.sub(
+        rf"(?P<lead>\bthe\s+|\b(?:{month_re})\s+)?"
+        rf"\b(?:(?P<tens>{tens_re})[\s-]+)?(?P<ord>{ordinal_re})\b",
+        lambda m: (m.group("lead") or "") + _replace_ordinal(m),
+        text, flags=re.IGNORECASE)
 
     def _replace(match):
         phrase = match.group(0)
@@ -625,6 +652,7 @@ _PROTECTED_RE = re.compile(
     r"|https?://\S+"                                            # absolute URLs
     r"|www\.[\w.-]+(?:/\S*)?"                                   # www. hosts
     rf"|\b[\w-]+\.(?:{'|'.join(_TLDS)})\b(?:/\S*)?"             # bare domains
+    rf"|{_INITIALISM_RE}"                                       # U.S., F.B.I.
     r"|\b\d+\.\d+\b"                                            # decimals
     r"|\b\d{1,2}:\d{2}\b",                                      # clock times
     flags=re.IGNORECASE,
@@ -685,9 +713,17 @@ def fix_capitalization(text):
     text = re.sub(r"\bi'(m|ll|ve|d)\b", lambda m: "I'" + m.group(1), text, flags=re.IGNORECASE)
     text = re.sub(r"\bi\b", "I", text)
 
-    # Names Whisper reliably lowercases.
+    # Weekdays are unambiguous.
     for word in _ALWAYS_CAPITALIZED:
         text = re.sub(rf"\b{word}\b", word.capitalize(), text)
+
+    # Months only when a day number is adjacent, so "we may ship it" is safe.
+    month_re = "|".join(_MONTHS)
+    text = re.sub(rf"\b({month_re})\b(?=\s+\d{{1,2}}\b)",
+                  lambda m: m.group(1).capitalize(), text, flags=re.IGNORECASE)
+    text = re.sub(rf"(?<=\b\d\s)\b({month_re})\b|(?<=\b\d\d\s)\b({month_re})\b",
+                  lambda m: (m.group(1) or m.group(2)).capitalize(),
+                  text, flags=re.IGNORECASE)
 
     def _upper_first(match):
         return match.group(1) + match.group(2).upper()
@@ -712,13 +748,19 @@ def apply_smart_quotes(text):
 
 
 def apply_substitutions(text, substitutions):
-    """User-defined find/replace rules, applied whole-word and case-insensitively."""
+    """User-defined find/replace rules, applied whole-word and case-insensitively.
+
+    The replacement goes through a function rather than a template string: as a
+    template, a backslash or a ``\\1`` in the user's own text is read as a group
+    reference and raises, taking the whole dictation down with it.
+    """
     if not text or not substitutions:
         return text
     for find, replace in substitutions.items():
         if not find:
             continue
-        text = re.sub(rf"\b{re.escape(find)}\b", replace, text, flags=re.IGNORECASE)
+        text = re.sub(rf"\b{re.escape(find)}\b", lambda _m, r=replace: r,
+                      text, flags=re.IGNORECASE)
     return text
 
 
@@ -781,8 +823,10 @@ def _sanitize_llm_output(raw_input, output):
     fence = re.match(r"^```[\w]*\n(.*)\n```$", text, flags=re.DOTALL)
     if fence:
         text = fence.group(1).strip()
-    # Strip a wrapping pair of quotes.
-    if len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'“‘":
+    # Strip a wrapping pair of quotes the model added — but only when the input
+    # was not itself quoted, or a sentence like '"Yes."' loses its own quotes.
+    if (len(text) >= 2 and text[0] == text[-1] and text[0] in "\"'“‘"
+            and raw_input.strip()[:1] not in "\"'“‘"):
         text = text[1:-1].strip()
     # Strip a chatty lead-in.
     text = re.sub(r"^(here (is|'s) (the )?(corrected|cleaned|formatted)[^:]*:\s*)", "",

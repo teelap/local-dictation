@@ -28,9 +28,9 @@ _last_lock = threading.Lock()
 # Trailing voice commands that fire a keystroke after the text is inserted.
 # Recognised only at the very end of a dictation — mid-sentence they are words.
 _TRAILING_ACTIONS = [
-    (re.compile(r"[\s,.]*\b(?:press|hit|push)\s+enter\b[\s.!?]*$", re.IGNORECASE), "enter"),
-    (re.compile(r"[\s,.]*\b(?:press|hit|push)\s+return\b[\s.!?]*$", re.IGNORECASE), "enter"),
-    (re.compile(r"[\s,.]*\b(?:press|hit|push)\s+tab\b[\s.!?]*$", re.IGNORECASE), "tab"),
+    (re.compile(r"[\s,]*\b(?:press|hit|push)\s+enter\b[\s.!?]*$", re.IGNORECASE), "enter"),
+    (re.compile(r"[\s,]*\b(?:press|hit|push)\s+return\b[\s.!?]*$", re.IGNORECASE), "enter"),
+    (re.compile(r"[\s,]*\b(?:press|hit|push)\s+tab\b[\s.!?]*$", re.IGNORECASE), "tab"),
 ]
 
 
