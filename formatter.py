@@ -339,11 +339,20 @@ def resolve_self_corrections(text):
         return (head + " ") if head else ""
 
     # <before> [,] MARKER [,] <replacement>
-    pattern = rf"(?P<before>[^.!?\n]*?)\s*,\s*(?:{marker_re})\s*,?\s+"
-    text = re.sub(pattern, _cut, text, flags=re.IGNORECASE)
+    #
+    # `before` is capped at five words rather than left unbounded. _cut never
+    # looks further back than that anyway, and an unbounded lazy match here is
+    # quadratic: with no sentence terminator to stop it — which is exactly what
+    # a long run-on dictation looks like — it rescans the whole transcript from
+    # every position, turning a 20-minute session into a 40-second stall.
+    before_re = r"(?P<before>(?:[^\s.!?\n]+[ \t]+){0,4}[^\s.!?\n]+)"
+    text = re.sub(rf"{before_re}\s*,\s*(?:{marker_re})\s*,?\s+",
+                  _cut, text, flags=re.IGNORECASE)
 
     # "scratch that" with no comma still means: discard the sentence so far.
-    text = re.sub(r"[^.!?\n]*\bscratch that\b[,]?\s*", "", text, flags=re.IGNORECASE)
+    # Guarded by a substring test so the greedy scan only runs when it can match.
+    if "scratch that" in text.lower():
+        text = re.sub(r"[^.!?\n]*\bscratch that\b[,]?\s*", "", text, flags=re.IGNORECASE)
 
     return _collapse_spaces(text)
 

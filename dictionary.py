@@ -281,6 +281,11 @@ def correct(text):
     if not word_positions:
         return text
 
+    # One matcher reused across every window: SequenceMatcher caches an index of
+    # its second sequence, so holding the term in seq2 and varying seq1 avoids
+    # rebuilding that index hundreds of thousands of times on a long transcript.
+    matcher = difflib.SequenceMatcher(autojunk=False)
+
     for entry in entries:
         term = entry["term"]
         # Count word tokens, not space-separated chunks: "faster-whisper" is
@@ -290,6 +295,16 @@ def correct(text):
             continue        # short terms fuzzy-match far too eagerly
 
         term_key = _fuzzy_key(term)
+        if not term_key:
+            continue
+        matcher.set_seq2(term_key)
+
+        # A ratio of 2M/(la+lb) cannot reach the threshold unless the two
+        # lengths are within this band, so most windows are rejected by a
+        # comparison instead of a full diff.
+        min_len = len(term_key) * MIN_FUZZY_RATIO / (2 - MIN_FUZZY_RATIO)
+        max_len = len(term_key) * (2 - MIN_FUZZY_RATIO) / MIN_FUZZY_RATIO
+
         index = 0
         while index <= len(word_positions) - span:
             start = word_positions[index]
@@ -298,7 +313,20 @@ def correct(text):
             if candidate.lower() == term.lower():
                 index += span
                 continue
-            ratio = difflib.SequenceMatcher(None, _fuzzy_key(candidate), term_key).ratio()
+
+            candidate_key = _fuzzy_key(candidate)
+            if not min_len <= len(candidate_key) <= max_len:
+                index += 1
+                continue
+
+            matcher.set_seq1(candidate_key)
+            # Both quick ratios are cheap upper bounds on the real one.
+            if (matcher.real_quick_ratio() < MIN_FUZZY_RATIO
+                    or matcher.quick_ratio() < MIN_FUZZY_RATIO):
+                index += 1
+                continue
+
+            ratio = matcher.ratio()
             if ratio >= MIN_FUZZY_RATIO:
                 logger.debug("Dictionary: %r -> %r (%.2f)", candidate, term, ratio)
                 tokens[start:end + 1] = [_match_case(candidate, term)]

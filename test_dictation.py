@@ -339,6 +339,51 @@ class SnippetTests(unittest.TestCase):
         self.assertIn(r"cost is $5 (50\% off) [sale]", text)
 
 
+class PerformanceTests(unittest.TestCase):
+    """Guards against the pipeline going superlinear.
+
+    The app supports 20-minute hands-free sessions, so the formatter has to cope
+    with several thousand words of run-on speech containing no punctuation for it
+    to anchor on. Both of these were quadratic once and stalled for tens of
+    seconds on exactly that input.
+    """
+
+    SENTENCE = ("um so i think we should uh ship it on friday at three thirty p m "
+                "and send the notes to john at gmail dot com about the twenty five "
+                "percent increase ")
+
+    def test_formatter_handles_a_long_session(self):
+        import time
+
+        text = self.SENTENCE * 300          # ~9,600 words, a full 20-minute session
+        started = time.perf_counter()
+        format_text(text, options=FormatOptions())
+        elapsed = time.perf_counter() - started
+        self.assertLess(elapsed, 5.0,
+                        f"formatting 9,600 words took {elapsed:.1f}s — check for "
+                        "an unbounded regex in the self-correction stage")
+
+    def test_dictionary_handles_a_long_session(self):
+        import time
+
+        directory = tempfile.mkdtemp()
+        try:
+            dictionary.init(directory)
+            dictionary.clear()
+            for index in range(120):
+                dictionary.add(f"Term{index}Word")
+
+            text = "we deployed the service and reviewed the metrics today " * 400
+            started = time.perf_counter()
+            dictionary.correct(text)
+            elapsed = time.perf_counter() - started
+            self.assertLess(elapsed, 8.0,
+                            f"correcting {len(text.split())} words against 120 terms "
+                            f"took {elapsed:.1f}s — check the fuzzy-match pre-filters")
+        finally:
+            shutil.rmtree(directory, ignore_errors=True)
+
+
 class ContextTests(unittest.TestCase):
     def test_known_app_maps_to_category(self):
         self.assertEqual(context.categorize("slack.exe", "")[0], context.CAT_WORK)
