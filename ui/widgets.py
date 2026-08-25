@@ -566,7 +566,10 @@ class Dropdown(tk.Canvas):
             row = tk.Label(
                 container, text=label, anchor="w", padx=12, pady=6,
                 bg=self.theme.get("accent") if selected else self.theme.get("surface"),
-                fg=self.theme.get("ink"), font=th.ui_font(self, 11),
+                # On the accent fill the label needs the accent's own ink, or it
+                # is cream-on-lilac in dark mode.
+                fg=self.theme.get("accent_ink") if selected else self.theme.get("ink"),
+                font=th.ui_font(self, 11),
                 width=max(18, int(self.winfo_width() / 8)))
             row.pack(fill=tk.X)
             row.bind("<Button-1>", lambda _e, v=option_value: self._choose(v))
@@ -679,8 +682,13 @@ class ScrollFrame(tk.Frame):
 
         self.body.bind("<Configure>", self._on_body_configure)
         self.canvas.bind("<Configure>", self._on_canvas_configure)
-        self.canvas.bind("<Enter>", lambda _e: self._bind_wheel())
-        self.canvas.bind("<Leave>", lambda _e: self._unbind_wheel())
+
+        # The wheel is bound application-wide and filtered by pointer position.
+        # Binding on the canvas's Enter/Leave does not work: moving the pointer
+        # onto the embedded body window counts as leaving the canvas, so the
+        # binding was dropped the moment the pointer reached the content.
+        self.bind("<Destroy>", lambda _e: self._unbind_wheel())
+        self._bind_wheel()
 
     def _style_scrollbar(self):
         """Tk scrollbars default to system grey, which fights the cream ground."""
@@ -710,7 +718,21 @@ class ScrollFrame(tk.Frame):
         self.canvas.unbind_all("<Button-4>")
         self.canvas.unbind_all("<Button-5>")
 
+    def _pointer_is_inside(self, event):
+        """True when the pointer sits over this frame or one of its children."""
+        try:
+            widget = self.winfo_containing(event.x_root, event.y_root)
+        except (tk.TclError, KeyError):
+            return False
+        while widget is not None:
+            if widget is self:
+                return True
+            widget = getattr(widget, "master", None)
+        return False
+
     def _on_wheel(self, event):
+        if not self._pointer_is_inside(event):
+            return
         if getattr(event, "num", None) == 4:
             delta = -1
         elif getattr(event, "num", None) == 5:

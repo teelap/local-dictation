@@ -590,6 +590,7 @@ class SettingsPage(Page):
         for child in self._llm_details.winfo_children():
             child.destroy()
         self._llm_model_dropdown = None
+        self._llm_listing_id = 0
 
         provider = self.hub.get_config("llm_provider", llm.PROVIDER_OFF)
         if provider == llm.PROVIDER_OFF:
@@ -637,19 +638,28 @@ class SettingsPage(Page):
 
     def _load_models(self, provider):
         """Ask the provider what it has. Ollama answers over HTTP, so: a thread."""
+        self._llm_listing_id += 1
+        listing_id = self._llm_listing_id
+
         def worker():
             try:
                 names = llm.list_models(self.hub.config_data)
             except Exception as e:  # noqa: BLE001
                 logger.warning("Model listing failed: %s", e)
                 names = list(llm.SUGGESTED_MODELS.get(provider, []))
-            self.hub.after(0, lambda: self._models_loaded(names))
+            self.hub.after(0, lambda: self._models_loaded(names, listing_id))
 
         threading.Thread(target=worker, daemon=True, name="llm-models").start()
 
-    def _models_loaded(self, names):
+    def _models_loaded(self, names, listing_id=None):
+        # Switching provider rebuilds the dropdown, so "still exists" is not
+        # enough — a slow listing for the old provider would land in the new
+        # widget. The generation token says whether this request is still current.
+        if listing_id is not None and listing_id != self._llm_listing_id:
+            logger.debug("Discarding a stale model listing")
+            return
+
         dropdown = self._llm_model_dropdown
-        # The provider may have changed again while the request was in flight.
         if dropdown is None or not dropdown.winfo_exists():
             return
 

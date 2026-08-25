@@ -134,8 +134,14 @@ class HomePage(Page):
         card.pack(fill=tk.X, pady=4)
 
         body = card.body
-        w.Label(body, theme, text=text, size=11, bg="surface", justify=tk.LEFT,
-                anchor="w", wraplength=760).pack(anchor="w", fill=tk.X)
+        # The card constrains its body to (card width - 2 x padding), so a fixed
+        # wraplength larger than that clips the transcript. Track the real width.
+        label = w.Label(body, theme, text=text, size=11, bg="surface",
+                        justify=tk.LEFT, anchor="w", wraplength=600)
+        label.pack(anchor="w", fill=tk.X)
+        body.bind("<Configure>",
+                  lambda event, lbl=label: lbl.configure(
+                      wraplength=max(200, event.width - 8)))
 
         meta = tk.Frame(body, bg=theme.surface)
         meta.pack(anchor="w", fill=tk.X, pady=(8, 0))
@@ -163,8 +169,13 @@ class HomePage(Page):
                  height=26, bg="surface",
                  command=lambda t=text: self._paste(t)).pack(side=tk.LEFT, padx=3)
 
-        # Only offer the revert when there is actually a different raw version.
-        if entry["raw"] and entry["raw"] != entry["text"] and not entry["reverted"]:
+        # Offer the swap whenever the two versions actually differ. It reads as
+        # "undo" going one way and "redo" coming back — the action is a toggle.
+        if entry["reverted"]:
+            w.Button(actions, theme, text="Redo AI edit", variant="secondary",
+                     size=9, height=26, bg="surface",
+                     command=lambda e=entry: self._revert(e)).pack(side=tk.LEFT, padx=3)
+        elif entry["raw"] and entry["raw"] != entry["text"]:
             w.Button(actions, theme, text="Undo AI edit", variant="secondary",
                      size=9, height=26, bg="surface",
                      command=lambda e=entry: self._revert(e)).pack(side=tk.LEFT, padx=3)
@@ -188,16 +199,25 @@ class HomePage(Page):
     def _paste(self, text):
         """Hide the Hub first, so the paste lands in the window behind it."""
         self.hub.hide()
-        self.hub.after(220, lambda: injector.insert(
-            text, mode=self.hub.get_config("output.paste_mode", "clipboard"),
-            restore_clipboard=self.hub.get_config("output.restore_clipboard", True)))
+
+        def _insert():
+            ok, message = injector.insert(
+                text, mode=self.hub.get_config("output.paste_mode", "clipboard"),
+                restore_clipboard=self.hub.get_config("output.restore_clipboard", True))
+            if not ok:
+                # Otherwise nothing appears and nothing explains why.
+                logger.warning("Re-paste from history failed: %s", message)
+                self.hub.after(0, lambda: self.hub.toast(message))
+
+        self.hub.after(220, _insert)
 
     def _revert(self, entry):
-        raw = history.revert_ai_edit(entry["id"])
-        if raw is None:
-            self.hub.toast("Could not restore the original.")
+        result = history.revert_ai_edit(entry["id"])
+        if result is None:
+            self.hub.toast("That entry is no longer there.")
             return
-        self.hub.toast("Restored the raw transcript.")
+        self.hub.toast("Showing the raw transcript." if not entry["reverted"]
+                       else "Showing the cleaned version.")
         self._refresh_feed()
 
     def _delete(self, entry):

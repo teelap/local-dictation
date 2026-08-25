@@ -276,21 +276,25 @@ class Hub(tk.Toplevel):
     # Theme
     # ------------------------------------------------------------------
     def toggle_theme(self):
+        previous = self.theme
         mode = "dark" if self.theme.mode == "light" else "light"
         self.theme = th.Theme(mode)
         self.set_config("ui.theme", mode)
-        self._apply_theme()
+        self._apply_theme(previous=previous)
 
     def _sync_theme_button(self):
         self._theme_button.set_text(
             "Light mode" if self.theme.mode == "dark" else "Dark mode")
 
-    def _apply_theme(self):
-        self.configure(bg=self.theme.bg)
-        self.sidebar.configure(bg=self.theme.surface_alt)
-        self.content.configure(bg=self.theme.bg)
-        self.header.configure(bg=self.theme.bg)
-        self.page_host.configure(bg=self.theme.bg)
+    def _apply_theme(self, previous=None):
+        # Plain frames carry no theme knowledge, so their new colour is derived
+        # from their old one. Repainting them all with the page background would
+        # flatten every card interior — a frame inside a Card is "surface", not
+        # "bg", and only the old palette can tell them apart.
+        translation = {}
+        if previous is not None:
+            for role, old_color in previous.colors.items():
+                translation.setdefault(old_color, self.theme.get(role))
 
         def walk(widget):
             for child in widget.winfo_children():
@@ -298,12 +302,25 @@ class Hub(tk.Toplevel):
                     child.set_theme(self.theme)
                 else:
                     try:
-                        child.configure(bg=self.theme.bg)
+                        replacement = translation.get(str(child.cget("bg")))
+                        if replacement:
+                            child.configure(bg=replacement)
                     except tk.TclError:
                         pass
                 walk(child)
 
         walk(self)
+
+        # The chrome is set last, deliberately. Setting it first and then
+        # walking would feed those widgets' brand-new colours back into the
+        # translation table, which maps the new background to whatever role held
+        # that value in the old palette — repainting the page with the ink colour.
+        self.configure(bg=self.theme.bg)
+        self.sidebar.configure(bg=self.theme.surface_alt)
+        self.content.configure(bg=self.theme.bg)
+        self.header.configure(bg=self.theme.bg)
+        self.page_host.configure(bg=self.theme.bg)
+
         self._sync_theme_button()
 
     # ------------------------------------------------------------------
