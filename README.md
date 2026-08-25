@@ -92,11 +92,16 @@ prompt budget.
 substitutions similar to what was emitted are learned, which is what separates
 "fixed my spelling" from "rewrote the sentence".
 
-### Snippets
+### Snippets and replacements
 
 Say a short phrase, get a saved block of text. `my work email` becomes your
 address; `standup` becomes your template. Supports `{date}`, `{time}`,
 `{datetime}`, `{iso_date}`, and `{clipboard}`.
+
+**Text replacements** on the Styles page are the blunter tool: literal
+find-and-replace applied to every dictation. Use the dictionary for names and
+jargon — it also improves recognition, rather than only fixing the text
+afterwards.
 
 ### Command mode
 
@@ -235,9 +240,16 @@ Nothing is sent anywhere unless you explicitly configure a cloud AI backend.
 python -m unittest test_dictation -v
 ```
 
-65 tests over the text pipeline, vocabulary, snippets, stats, and context
-resolution. Every case is either a behaviour from the spec or a bug found during
-the build, so a failure means real user-visible output changed.
+106 tests over the text pipeline, vocabulary, snippets, history, stats, config
+migration, and context resolution. Every case is either a behaviour from the
+spec or a bug found during the build, so a failure means real user-visible
+output changed. A further set covering the hotkey state machine runs where the
+audio and hotkey dependencies are installed, and skips cleanly where they are not.
+
+Two of the tests are performance guards. The app supports 20-minute hands-free
+sessions, and both the formatter and the vocabulary pass were quadratic on
+exactly that input — several thousand words of run-on speech with no punctuation
+to anchor on.
 
 ---
 
@@ -273,3 +285,7 @@ you use it, that is the one part of the subscription this does not replace.
   at higher privilege than this app. Use `Shift+Alt+Z` with that window focused,
   or run the app elevated too.
 - **First dictation after launch** waits for the speech model to load.
+- **Insertion does not read the text around your cursor.** Continuing a sentence
+  you had already started will capitalize as if it were a new one. Matching that
+  seam needs to read the focused text field, which is exactly the screen-reading
+  this app avoids.
