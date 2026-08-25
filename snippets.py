@@ -205,15 +205,30 @@ def expand(text, clipboard_text=""):
         return text, []
 
     fired = []
+    # Expansions are parked behind placeholders while the remaining snippets are
+    # matched, so an expansion that happens to contain another trigger is not
+    # itself expanded. A signature block ending in the word "sig" should stay
+    # that word, not turn into whatever the "sig" snippet holds.
+    expansions = []
+
     for snippet in sorted(active, key=lambda s: len(s["trigger"]), reverse=True):
         # Tolerate the punctuation and spacing variance of dictated speech.
         pattern = r"\s+".join(re.escape(word) for word in snippet["trigger"].split())
         regex = re.compile(rf"\b{pattern}\b", re.IGNORECASE)
         if not regex.search(text):
             continue
+
         expansion = _resolve_variables(snippet["expansion"], clipboard_text)
-        text = regex.sub(lambda _m, e=expansion: e, text)
+
+        def _park(_match, value=expansion):
+            expansions.append(value)
+            return f"\x00s{len(expansions) - 1}\x00"
+
+        text = regex.sub(_park, text)
         fired.append(snippet["trigger"])
+
+    for index, value in enumerate(expansions):
+        text = text.replace(f"\x00s{index}\x00", value)
 
     if fired:
         # Splicing an expansion mid-sentence tends to leave doubled spaces or a

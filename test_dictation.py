@@ -317,6 +317,27 @@ class SnippetTests(unittest.TestCase):
         self.assertEqual(text, "nothing to see here")
         self.assertEqual(fired, [])
 
+    def test_expansion_containing_another_trigger_does_not_cascade(self):
+        """Regression: a signature ending in "sig" expanded the "sig" snippet."""
+        snippets.add("my signature block", "Best regards, sig")
+        snippets.add("sig", "Jacob Tlapek")
+        text, fired = snippets.expand("thanks, my signature block")
+        self.assertEqual(text, "thanks, Best regards, sig")
+        self.assertEqual(fired, ["my signature block"])
+
+    def test_two_independent_triggers_both_fire(self):
+        snippets.add("my work email", "jacob@tlapek.com")
+        snippets.add("standup", "Yesterday:")
+        text, fired = snippets.expand("my work email and standup")
+        self.assertIn("jacob@tlapek.com", text)
+        self.assertIn("Yesterday:", text)
+        self.assertEqual(len(fired), 2)
+
+    def test_expansion_with_regex_metacharacters_is_literal(self):
+        snippets.add("regex snippet", r"cost is $5 (50\% off) [sale]")
+        text, _ = snippets.expand("the regex snippet applies")
+        self.assertIn(r"cost is $5 (50\% off) [sale]", text)
+
 
 class ContextTests(unittest.TestCase):
     def test_known_app_maps_to_category(self):

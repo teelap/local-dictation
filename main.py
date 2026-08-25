@@ -246,7 +246,10 @@ class DictationApp:
             return
         try:
             import keyboard
-            keyboard.unhook_all_hotkeys()
+            # unhook_all_hotkeys() only clears add_hotkey registrations; the
+            # push-to-talk release handler is a key hook and would survive,
+            # stacking a duplicate every time settings are saved.
+            keyboard.unhook_all()
         except Exception as e:  # noqa: BLE001
             logger.debug("Could not unhook hotkeys: %s", e)
         self._hooks = []
