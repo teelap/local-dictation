@@ -102,6 +102,7 @@ class TrayIcon:
         self._paused = False
         self._animating = False
         self._animation_thread = None
+        self._animation_id = 0
         self._phase = 0.0
 
     # ------------------------------------------------------------------
@@ -218,15 +219,20 @@ class TrayIcon:
     def _start_animation(self):
         if self._animating:
             return
+        # A generation token, not just the flag: the previous thread spends most
+        # of its life asleep, so a quick stop/start would leave it running
+        # alongside the new one once the flag flipped back to True.
         self._animating = True
+        self._animation_id += 1
         self._animation_thread = threading.Thread(
-            target=self._animate, daemon=True, name="tray-animation")
+            target=self._animate, args=(self._animation_id,),
+            daemon=True, name="tray-animation")
         self._animation_thread.start()
 
     def _stop_animation(self):
         self._animating = False
 
-    def _animate(self):
+    def _animate(self, animation_id):
         import math
 
         color = _STATE_COLORS.get(self._state, _STATE_COLORS[STATE_RECORDING])
@@ -240,7 +246,7 @@ class TrayIcon:
         if device:
             tooltip = f"{tooltip} · {device}"
 
-        while self._animating:
+        while self._animating and self._animation_id == animation_id:
             try:
                 rms = audio_mod.get_rms()
                 level = min(1.0, (rms ** 0.25) * 1.5)

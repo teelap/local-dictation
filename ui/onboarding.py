@@ -104,11 +104,16 @@ class Onboarding(tk.Toplevel):
         if self._step >= len(self._steps) - 1:
             self._finish()
             return
+        # The mic step holds the shared audio stream open for its level meter.
+        # Leaving it running would leak the device and feed meter audio into the
+        # next real dictation, since the capture globals are module-wide.
+        self._stop_meter()
         self._step += 1
         self._render()
 
     def _retreat(self):
         if self._step > 0:
+            self._stop_meter()
             self._step -= 1
             self._render()
 
@@ -212,6 +217,11 @@ class Onboarding(tk.Toplevel):
         self.after(150, self._start_meter)
 
     def _stop_meter(self):
+        # Guarded on the flag: this is called on every step change, and calling
+        # discard_recording() when the meter was never started would tear down
+        # whatever session the app itself has open.
+        if not getattr(self, "_meter_running", False):
+            return
         self._meter_running = False
         try:
             audio_mod.discard_recording()

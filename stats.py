@@ -60,15 +60,28 @@ def load():
 
 
 def save():
+    """Write stats atomically.
+
+    record_session runs on the dictation worker while Reset runs on the Tk
+    thread; truncating the real file in place lets one of them read a
+    half-written file, or lose the other's write entirely.
+    """
     if not _path:
         return
+    temp_path = f"{_path}.{os.getpid()}.{threading.get_ident()}.tmp"
     try:
         with _lock:
             snapshot = json.dumps(_data, indent=2)
-        with open(_path, "w", encoding="utf-8") as f:
-            f.write(snapshot)
+            with open(temp_path, "w", encoding="utf-8") as f:
+                f.write(snapshot)
+            os.replace(temp_path, _path)
     except OSError as e:
         logger.warning("Could not save stats: %s", e)
+        try:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+        except OSError:
+            pass
 
 
 def _blank_day():

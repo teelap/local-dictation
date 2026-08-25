@@ -39,6 +39,11 @@ _started_at = 0.0
 _monitor_thread = None
 _callbacks = {}
 
+# Incremented on every start. The monitor thread captures it and exits if a new
+# session begins, so a watchdog from the previous recording can never fire
+# against the current one.
+_session_id = 0
+
 
 def query_input_devices():
     """Return (index, name) for every input-capable device."""
@@ -71,7 +76,7 @@ def _recording_callback(indata, frames, time_info, status):
     _queue.put(indata.copy())
 
 
-def _monitor(config):
+def _monitor(config, session_id):
     """Watch the live session for silence, a dead mic, and the time limit.
 
     Runs on its own thread and only ever fires callbacks — it never touches the
@@ -89,9 +94,9 @@ def _monitor(config):
     warn_before = config.get("warn_before_limit_seconds", 60)
     silence_rms = config.get("silence_rms", SILENCE_RMS)
 
-    while _recording:
+    while _recording and _session_id == session_id:
         time.sleep(tick)
-        if not _recording:
+        if not _recording or _session_id != session_id:
             break
 
         elapsed = time.monotonic() - _started_at
@@ -149,7 +154,8 @@ def start_recording(sample_rate=16000, channels=1, device_index=None,
     Returns:
         True if the stream opened.
     """
-    global _stream, _recording, _monitor_thread, _last_rms, _peak_rms, _started_at, _callbacks
+    global _stream, _recording, _monitor_thread, _last_rms, _peak_rms
+    global _started_at, _callbacks, _session_id
 
     config = config or {}
     _callbacks = callbacks or {}
@@ -164,6 +170,8 @@ def start_recording(sample_rate=16000, channels=1, device_index=None,
         _last_rms = 0.0
         _peak_rms = 0.0
         _started_at = time.monotonic()
+        _session_id += 1
+        session_id = _session_id
         _recording = True
 
         kwargs = {"samplerate": sample_rate, "channels": channels,
@@ -184,7 +192,7 @@ def start_recording(sample_rate=16000, channels=1, device_index=None,
         logger.info("Recording started (device=%s, rate=%d)", device_index, sample_rate)
 
     _monitor_thread = threading.Thread(
-        target=_monitor, args=(config,), daemon=True, name="audio-monitor")
+        target=_monitor, args=(config, session_id), daemon=True, name="audio-monitor")
     _monitor_thread.start()
     return True
 
@@ -239,6 +247,8 @@ def discard_recording():
     """Stop capture and throw the audio away — the cancel path."""
     global _stream, _recording
 
+    # The drain stays inside the lock: releasing it first lets the next session
+    # start and then have its opening frames eaten by this cleanup.
     with _stream_lock:
         _recording = False
         if _stream is not None:
@@ -249,11 +259,11 @@ def discard_recording():
                 logger.warning("Error closing stream: %s", e)
             _stream = None
 
-    while not _queue.empty():
-        try:
-            _queue.get_nowait()
-        except queue.Empty:
-            break
+        while not _queue.empty():
+            try:
+                _queue.get_nowait()
+            except queue.Empty:
+                break
     logger.info("Recording discarded")
 
 

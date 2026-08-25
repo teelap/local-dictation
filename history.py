@@ -58,17 +58,28 @@ def load():
 
 
 def save():
+    """Write history atomically.
+
+    The whole write happens under the lock and through a per-writer temp file:
+    the dictation worker and the Tk thread both save, and a shared temp path
+    lets two interleaved writers publish a half-written file.
+    """
     if not _persist or not _path:
         return
+    temp_path = f"{_path}.{os.getpid()}.{threading.get_ident()}.tmp"
     try:
         with _lock:
             payload = json.dumps(list(_entries), indent=2, ensure_ascii=False)
-        temp_path = _path + ".tmp"
-        with open(temp_path, "w", encoding="utf-8") as f:
-            f.write(payload)
-        os.replace(temp_path, _path)
+            with open(temp_path, "w", encoding="utf-8") as f:
+                f.write(payload)
+            os.replace(temp_path, _path)
     except OSError as e:
         logger.warning("Could not save history: %s", e)
+        try:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+        except OSError:
+            pass
 
 
 def _normalize(entry):

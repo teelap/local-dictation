@@ -264,20 +264,41 @@ class DictationApp:
         now = time.monotonic()
         double_tap_window = self.config.get("double_tap_seconds", 0.4)
 
-        # A second tap inside the window latches the session on, so one key does
-        # both hold-to-talk and hands-free.
+        # A second press inside the window latches recording on, so one key does
+        # both hold-to-talk and hands-free. The first tap has usually already
+        # been discarded as too short by then, so this has to latch whether or
+        # not a session is still live — otherwise tap-then-hold never locks.
         if now - self._last_tap_time < double_tap_window:
             self._last_tap_time = 0.0
+            self._latched = True
             if self._recording:
-                self._latched = True
-                logger.info("Session latched to hands-free")
+                logger.info("Live session latched to hands-free")
                 return
+            logger.info("Double tap — starting a latched session")
+            self._press_time = now
+            self._start_session(MODE_DICTATION)
+            return
+
         self._last_tap_time = now
 
         if self._recording:
             return
         self._press_time = now
         self._start_session(MODE_DICTATION)
+
+    def _is_prefix_echo(self):
+        """True when a session was started microseconds ago by a shorter binding.
+
+        The default bindings are nested — push-to-talk is Ctrl+Win, command mode
+        is Ctrl+Win+Alt — and a hotkey library fires the shorter combination the
+        moment its keys are down, before the extra key is even pressed. So
+        reaching a superset handler with a brand-new session in flight means the
+        prefix fired first, not that the user wants to stop.
+        """
+        if not self._recording:
+            return False
+        threshold = max(0.2, float(self.config.get("min_hold_seconds", 0.35)))
+        return (time.monotonic() - self._session_started) < threshold
 
     def _on_ptt_release(self, _event=None):
         if not self._recording or self._latched:
@@ -295,6 +316,12 @@ class DictationApp:
 
     def _on_hands_free(self):
         if self._recording:
+            # Ctrl+Win+Space arrives just after Ctrl+Win already started a
+            # push-to-talk session; latch that session rather than ending it.
+            if self._is_prefix_echo():
+                self._latched = True
+                logger.info("Hands-free latched the push-to-talk session")
+                return
             self._latched = False
             self._finish_session()
             return
@@ -305,9 +332,15 @@ class DictationApp:
 
     def _on_command_mode(self):
         if self._recording:
-            self._latched = False
-            self._finish_session()
-            return
+            if self._is_prefix_echo() and self._mode == MODE_DICTATION:
+                # Same nesting, but this session is the wrong mode. Throw away
+                # the fraction of a second of audio and start a command session.
+                logger.info("Converting a prefix-triggered session to command mode")
+                self._abort_session(silent=True)
+            else:
+                self._latched = False
+                self._finish_session()
+                return
         if not self._ready_to_record():
             return
         self._latched = True
@@ -375,7 +408,10 @@ class DictationApp:
             })
 
         if not started:
+            # _latched must be cleared too: leaving it set makes the next
+            # push-to-talk release a no-op, so recording never stops again.
             self._recording = False
+            self._latched = False
             self.overlay.hide()
             self.tray.set_state(STATE_ERROR)
             self.tray.notify("Microphone unavailable",
@@ -388,11 +424,21 @@ class DictationApp:
             self._finish_session()
 
     def cancel(self):
-        """Discard the recording without transcribing or inserting anything."""
-        if not self._recording:
+        """Discard the current dictation without inserting anything.
+
+        Also works during transcription: the worker checks the flag before it
+        touches the text field, so Esc still saves you once you have realised
+        you were dictating into the wrong window.
+        """
+        if self._recording:
+            logger.info("Session cancelled by user")
+            self._abort_session(silent=False)
             return
-        logger.info("Session cancelled by user")
-        self._abort_session(silent=False)
+        if self._processing:
+            logger.info("Cancelled while transcribing — output will be suppressed")
+            self._cancelled = True
+            self.tray.notify("Dictation cancelled", "Nothing was inserted.",
+                             category="tips")
 
     def _abort_session(self, silent=False):
         with self._session_lock:
@@ -440,6 +486,10 @@ class DictationApp:
             raw = self._transcribe(wav_path)
             if not raw:
                 logger.info("No speech detected")
+                return
+
+            if self._cancelled:
+                logger.info("Discarding transcript — cancelled during transcription")
                 return
 
             if mode == MODE_COMMAND:

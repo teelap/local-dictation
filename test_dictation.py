@@ -463,5 +463,135 @@ class StatsTests(unittest.TestCase):
         self.assertEqual(totals["apps"]["code.exe"], 2)
 
 
+try:
+    import main as main_module
+    _MAIN_IMPORTABLE = True
+except Exception:  # noqa: BLE001 — sounddevice/keyboard are absent off Windows
+    _MAIN_IMPORTABLE = False
+
+
+@unittest.skipUnless(_MAIN_IMPORTABLE, "requires the audio and hotkey dependencies")
+class HotkeyStateMachineTests(unittest.TestCase):
+    """The interleavings that a hotkey library's prefix matching actually produces.
+
+    The default bindings are nested — push-to-talk is Ctrl+Win and command mode
+    is Ctrl+Win+Alt — and the shorter combination fires the moment its keys are
+    down. Every case here is a state the app has to survive.
+    """
+
+    def setUp(self):
+        import threading
+
+        self.dir = tempfile.mkdtemp()
+        import config_manager
+        self.app = main_module.DictationApp.__new__(main_module.DictationApp)
+        self.app.config = copy_default_config(config_manager)
+        self.app._session_lock = threading.Lock()
+        self.app._model_ready = threading.Event()
+        self.app._model_ready.set()
+        self.app._recording = False
+        self.app._processing = False
+        self.app._paused = False
+        self.app._mode = "dictation"
+        self.app._session_started = 0.0
+        self.app._latched = False
+        self.app._press_time = 0.0
+        self.app._last_tap_time = 0.0
+        self.app._pending_selection = ""
+        self.app._cancelled = False
+        self.app.tray = _NullTray()
+        self.app.overlay = _NullOverlay()
+        self.app.root = None
+        self.app.hub = None
+
+    def tearDown(self):
+        import audio
+        try:
+            audio.discard_recording()
+        except Exception:  # noqa: BLE001
+            pass
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def test_command_mode_survives_the_push_to_talk_prefix(self):
+        self.app._on_ptt_press()
+        self.app._on_command_mode()
+        self.assertTrue(self.app._recording)
+        self.assertEqual(self.app._mode, "command")
+
+    def test_hands_free_latches_rather_than_ending_the_prefix_session(self):
+        self.app._on_ptt_press()
+        self.app._on_hands_free()
+        self.assertTrue(self.app._recording)
+        self.assertTrue(self.app._latched)
+
+    def test_hands_free_still_stops_a_mature_session(self):
+        import time
+
+        self.app._on_ptt_press()
+        self.app._session_started = time.monotonic() - 5.0
+        self.app._on_hands_free()
+        self.assertFalse(self.app._recording)
+
+    def test_double_tap_latches_and_survives_release(self):
+        import time
+
+        self.app._on_ptt_press()
+        self.app._press_time = time.monotonic() - 0.01
+        self.app._on_ptt_release()               # too short — discarded
+        self.assertFalse(self.app._recording)
+
+        self.app._on_ptt_press()                 # second press inside the window
+        self.assertTrue(self.app._latched)
+        self.app._on_ptt_release()               # must not end a latched session
+        self.assertTrue(self.app._recording)
+
+    def test_microphone_failure_clears_the_latch(self):
+        import audio
+
+        original = audio.start_recording
+        audio.start_recording = lambda **_kwargs: False
+        try:
+            self.app._on_hands_free()
+        finally:
+            audio.start_recording = original
+
+        self.assertFalse(self.app._latched)
+        self.assertFalse(self.app._recording)
+
+    def test_cancel_during_transcription_suppresses_output(self):
+        self.app._processing = True
+        self.app._recording = False
+        self.app.cancel()
+        self.assertTrue(self.app._cancelled)
+
+
+def copy_default_config(config_manager):
+    import copy
+
+    return copy.deepcopy(config_manager.DEFAULT_CONFIG)
+
+
+class _NullTray:
+    def notify(self, *args, **kwargs):
+        pass
+
+    def set_state(self, state):
+        pass
+
+
+class _NullOverlay:
+    def show_recording(self):
+        pass
+
+    def show_command(self):
+        pass
+
+    def show_transcribing(self):
+        pass
+
+    def hide(self):
+        pass
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
