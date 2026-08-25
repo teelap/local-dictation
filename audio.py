@@ -161,6 +161,17 @@ def start_recording(sample_rate=16000, channels=1, device_index=None,
     _callbacks = callbacks or {}
 
     with _stream_lock:
+        # Defensive: a caller that forgot to stop a previous capture (the
+        # onboarding level meter shares this stream) would otherwise leak the
+        # device handle when _stream is overwritten below.
+        if _stream is not None:
+            try:
+                _stream.stop()
+                _stream.close()
+            except Exception as e:  # noqa: BLE001
+                logger.warning("Error closing a stream still open: %s", e)
+            _stream = None
+
         while not _queue.empty():
             try:
                 _queue.get_nowait()

@@ -72,6 +72,9 @@ class Card(tk.Canvas):
         # canvas does not grow with its contents, so without this any label that
         # wraps to an extra line is silently clipped at the card's edge.
         self._min_height = int(kwargs.pop("height", 0) or 0)
+        # Guards the height override below against the auto-sizer's own writes,
+        # which would otherwise ratchet the floor up and never let it back down.
+        self._sizing = False
         super().__init__(parent, highlightthickness=0, bd=0,
                          bg=theme.get(bg), height=max(1, self._min_height), **kwargs)
 
@@ -82,15 +85,32 @@ class Card(tk.Canvas):
         self.bind("<Configure>", self._redraw)
         self.body.bind("<Configure>", lambda _e: self._sync_height())
 
+    def configure(self, cnf=None, **kwargs):
+        """Treat an explicit height as a new floor, not a one-off.
+
+        Otherwise a caller shrinking a card (a section collapsing, say) is
+        immediately overruled by the auto-sizer, which still holds the height
+        the card was constructed with.
+        """
+        if not self._sizing and "height" in kwargs:
+            self._min_height = int(kwargs["height"] or 0)
+        return super().configure(cnf, **kwargs)
+
+    config = configure
+
     def _sync_height(self):
-        """Grow the canvas to fit whatever the body needs."""
+        """Resize the canvas to fit whatever the body needs."""
         needed = max(self._min_height,
                      self.body.winfo_reqheight() + self._padding * 2)
         try:
             if abs(needed - int(self.cget("height"))) > 1:
-                self.configure(height=needed)
+                self._sizing = True
+                try:
+                    self.configure(height=needed)
+                finally:
+                    self._sizing = False
         except (tk.TclError, ValueError):
-            pass
+            self._sizing = False
 
     def _redraw(self, _event=None):
         width, height = self.winfo_width(), self.winfo_height()
