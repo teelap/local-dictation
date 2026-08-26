@@ -23,3 +23,13 @@ temp_dictation.wav
 # IDE
 .vscode/
 .idea/
+
+# Runtime state — created next to the app on first launch
+config.json
+history.json
+dictionary.json
+snippets.json
+stats.json
+transforms.json
+dictation.log
+dictation.log.*

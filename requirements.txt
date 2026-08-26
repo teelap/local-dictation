@@ -1,9 +1,20 @@
+# Speech recognition — runs entirely on your machine.
 faster-whisper
+
+# Audio capture and WAV writing.
 sounddevice
 soundfile
+numpy
+
+# Global hotkeys and text injection (Windows).
 keyboard
 pyautogui
 pyperclip
-numpy
+
+# Tray icon and its generated glyphs.
 Pillow
 pystray
+
+# Optional: only needed if you set the AI cleanup backend to "anthropic".
+# Ollama and OpenAI-compatible backends need nothing extra — they use urllib.
+# anthropic
